@@ -1,0 +1,16 @@
+.git
+.github
+.tools
+.venv
+RESULTS
+jobs
+dist
+__pycache__
+*.pyc
+*.pyo
+*.log
+app/svacer-settings.json
+app/svacer-mcp
+secrets
+*.env
+.env*

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Вход — Svacer Triage</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <h1>Svacer Triage</h1>
+    <p>Введите токен доступа к внутреннему web-сервису.</p>
+    <form action="/login" method="post">
+      <label for="token">Токен</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" required autofocus>
+      <button type="submit" class="primary">Войти</button>
+    </form>
+    <p class="error login-error">Токен не принят.</p>
+  </main>
+  <script src="/static/login.js" defer></script>
+</body>
+</html>

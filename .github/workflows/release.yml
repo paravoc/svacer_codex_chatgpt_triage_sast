@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-package:
+    needs: container-image
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build portable desktop package
+        shell: pwsh
+        run: |
+          & ./app/make_portable_package.ps1
+          $archive = Get-ChildItem ./ARCHIVE/*.zip | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $archive) { throw "Portable archive was not created" }
+          $target = "svacer-triage-windows-$env:GITHUB_REF_NAME.zip"
+          Move-Item -LiteralPath $archive.FullName -Destination $target
+          $digest = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $target" | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @"
+          Windows desktop package and Linux container are built from the same verified commit.
+
+          Web service (recommended): ghcr.io/${{ github.repository }}:$($env:GITHUB_REF_NAME.TrimStart('v'))
+
+          Windows desktop (optional): download the ZIP, extract it, and open START.vbs (START.cmd is kept for compatibility). The first launch installs the locked dependencies without a console window and then opens the Svacer sign-in form automatically.
+
+          Secrets are not included. Every user must provide their own Svacer credentials and, for the server container, a separate Codex API key.
+          "@ | Set-Content -LiteralPath RELEASE_NOTES.md -Encoding utf8
+          gh release create "$env:GITHUB_REF_NAME" `
+            "svacer-triage-windows-$env:GITHUB_REF_NAME.zip" `
+            SHA256SUMS.txt --verify-tag --title "Svacer Triage $env:GITHUB_REF_NAME" `
+            --notes-file RELEASE_NOTES.md
+
+  container-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Sign in to GitHub Container Registry
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and publish container
+        run: |
+          image="$(echo "ghcr.io/$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          version="${GITHUB_REF_NAME#v}"
+          docker build --tag "$image:$version" --tag "$image:latest" .
+          docker push "$image:$version"
+          docker push "$image:latest"

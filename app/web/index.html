@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Svacer Triage</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div><h1>Svacer Triage</h1><p id="connection">Web-сервис подключён</p></div>
+    <form action="/logout" method="post" id="logout-form"><button type="submit">Выйти</button></form>
+  </header>
+  <main>
+    <section class="toolbar panel">
+      <label for="jobs">Сохранённая задача</label>
+      <select id="jobs"></select>
+      <button id="reload-jobs">Обновить</button>
+      <button id="new-project" class="violet">Новый проект</button>
+    </section>
+    <section id="message" class="message" aria-live="polite"></section>
+    <section class="stats">
+      <article class="panel"><span>Маркеров</span><strong id="total">—</strong></article>
+      <article class="panel"><span>Готово</span><strong id="completed">—</strong></article>
+      <article class="panel"><span>В очереди</span><strong id="queued">—</strong></article>
+      <article class="panel"><span>Состояние</span><strong id="run-state">—</strong></article>
+    </section>
+    <section class="actions panel">
+      <button id="refresh-markers">Получить/обновить маркеры</button>
+      <button id="start" class="success">Начать анализ</button>
+      <button id="stop" class="danger">Завершить анализ</button>
+      <button id="preview-import" class="warning">Проверить отправку</button>
+      <button id="apply-import" class="danger" disabled>Отправить в Svacer</button>
+    </section>
+    <section class="workspace">
+      <div class="panel marker-panel">
+        <div class="filter-row">
+          <input id="search" type="search" placeholder="Поиск по детектору, файлу, ID…">
+          <select id="status-filter">
+            <option value="all">Все маркеры</option>
+            <option value="queued">В очереди</option>
+            <option value="active">В работе</option>
+            <option value="Confirmed">Confirmed</option>
+            <option value="False Positive">False Positive</option>
+            <option value="Won't fix">Won't fix</option>
+            <option value="Unclear">Unclear</option>
+          </select>
+        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th></th><th>Статус</th><th>Детектор</th><th>Файл</th><th>Строка</th></tr></thead>
+          <tbody id="markers"></tbody>
+        </table></div>
+        <div class="queue-actions">
+          <span id="shown">Показано: 0</span>
+          <button id="enqueue">Добавить в очередь</button>
+          <button id="dequeue" class="warning">Убрать из очереди</button>
+        </div>
+      </div>
+      <aside class="panel details"><h2>Карточка маркера</h2><pre id="details">Выберите маркер.</pre></aside>
+    </section>
+  </main>
+
+  <dialog id="project-dialog">
+    <form method="dialog" id="project-form">
+      <h2>Новый проект</h2>
+      <label>Полная ссылка на снимок Svacer<input id="snapshot-url" required></label>
+      <label>Git-репозиторий<input id="repository-url" type="url" required></label>
+      <div class="inline"><button type="button" id="load-refs">Загрузить теги и ветки</button><span id="refs-status"></span></div>
+      <label>Версия исходников<select id="refs" required><option value="">Сначала загрузите список</option></select></label>
+      <div class="dialog-actions"><button value="cancel">Отмена</button><button type="submit" value="default" class="success">Создать проект</button></div>
+    </form>
+  </dialog>
+  <dialog id="import-dialog">
+    <form method="dialog" id="import-form">
+      <h2>Точное подтверждение отправки</h2>
+      <p id="import-summary"></p><code id="confirmation-phrase"></code>
+      <label>Введите фразу дословно<input id="confirmation" autocomplete="off" required></label>
+      <div class="dialog-actions"><button value="cancel">Отмена</button><button type="submit" value="default" class="danger">Отправить</button></div>
+    </form>
+  </dialog>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

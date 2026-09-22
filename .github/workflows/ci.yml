@@ -1,0 +1,44 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: poetry.lock
+      - name: Install pinned Poetry bootstrap
+        run: python -m pip install poetry==2.2.1
+      - name: Sync locked dependencies
+        run: poetry sync --with desktop,dev --no-root
+      - name: Validate lock and run tests
+        shell: pwsh
+        run: |
+          poetry check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $lines = & poetry run pytest app/tests -q 2>&1
+          $exitCode = $LASTEXITCODE
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($exitCode -ne 0) {
+            $tail = (($lines | Select-Object -Last 80) -join "`n")
+            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error file=.github/workflows/ci.yml,line=1,title=pytest failed::$escaped"
+            exit $exitCode
+          }
+
+  container-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build production image
+        run: docker build --tag svacer-triage:test .

@@ -1,0 +1,36 @@
+# Local state and user data: never commit scan results or credentials.
+/RESULTS/
+/jobs/
+/ARCHIVE/
+/logs/
+/secrets/
+/START.lnk
+/.venv/
+/.tools/
+/.pytest_cache/
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+*.log
+*.egg-info/
+*.db
+*.sqlite*
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+/app/svacer-settings.json
+/app/svacer-mcp/
+/app/review_existing_proxy_wontfix.py
+/docs/AUDIT-*.md
+/docs/EVIDENCE-AUDIT-*.md
+/docs/TEST_REPORT.md
+
+# Local editor and build outputs.
+.idea/
+.vscode/
+dist/
+build/
+*.zip

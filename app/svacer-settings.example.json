@@ -1,0 +1,11 @@
+{
+  "svacer_url": "https://svacer.example.invalid",
+  "mcp_url": "http://127.0.0.1:8002/mcp",
+  "filter_name": "ГОСТ 71207-2024",
+  "advanced_filter": "filter(markers, \"ГОСТ 71207-2024\" in .checker_labels)",
+  "parallel_workers": 1,
+  "verification_enabled": true,
+  "verification_verdicts": ["Confirmed"],
+  "verification_workers": 1,
+  "saved_context_token_warning": 200000
+}
