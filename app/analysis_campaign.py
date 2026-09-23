@@ -74,6 +74,63 @@ def age_seconds(stamp: str | None, now: float) -> float:
         return float("inf")
 
 
+def release_user_stop_for_manual_start(job: Path) -> int | None:
+    """Detach ONE explicitly started idle job; keep quota protection and campaign stop.
+
+    Caller holds the job lifecycle/decision locks. Never use from automatic retries.
+    The campaign lock also excludes a supervisor starting during this handover.
+    """
+    from usage_guard import SETTING, validate_threshold
+
+    job = job.resolve()
+    guard_path = job / GUARD_FILE
+    if not guard_path.exists():
+        return None
+    guard = r.read_json(guard_path)
+    if guard.get("enabled") is False:
+        return None
+    campaign_path = Path(str(guard.get("campaign") or "")).resolve()
+    if campaign_path.parent != job.parent or campaign_path.suffix != ".json":
+        raise RuntimeError("Не удалось проверить прежнюю кампанию; ограничение сохранено.")
+    if r.process_is_alive(guard.get("supervisor_pid")):
+        raise RuntimeError("Контроллер кампании ещё работает. Дождитесь его остановки.")
+    with q.decision_lock(campaign_path):
+        # Re-read under the supervisor's own lock, not a stale UI snapshot.
+        guard = r.read_json(guard_path)
+        config = r.read_json(campaign_path)
+        state = r.read_json(campaign_path.with_name(campaign_path.stem + "-status.json"))
+        if (Path(str(guard.get("campaign") or "")).resolve() != campaign_path
+                or Path(str(config.get("root") or "")).resolve() != job.parent.parent
+                or job.name not in {item.get("job") for item in config.get("jobs", [])}):
+            raise RuntimeError("Задача не соответствует прежней кампании; ограничение сохранено.")
+        if state.get("status") != "user_stopped" or guard.get("allow") is not False:
+            raise RuntimeError(lease_reason(job) or "Кампания не остановлена пользователем.")
+        if any(r.process_is_alive(pid) for pid in (guard.get("supervisor_pid"), state.get("supervisor_pid"))):
+            raise RuntimeError("Контроллер кампании ещё работает. Дождитесь его остановки.")
+        run = r.read_run_record(job)
+        if run.get("active") or any(r.process_is_alive(run.get(key)) for key in ("runner_pid", "codex_pid")):
+            raise RuntimeError("Прежний анализ ещё завершает работу. Повторите запуск после остановки.")
+        floor, reserve = config.get("minimum_remaining_percent"), config.get("reserve_percent", 5)
+        previous = guard.get("stop_at_remaining_percent")
+        if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (floor, reserve, previous))
+                or not 0 <= floor < floor + reserve < 100 or not 0 < previous < 100):
+            raise RuntimeError("Не удалось перенести защитный порог кампании; ограничение сохранено.")
+        metadata = r.read_json(job / "job.json")
+        old_setting = validate_threshold(metadata.get(SETTING, 0))
+        # A chosen setting belongs to the new manual run, not the retired campaign.
+        # Older jobs without a setting inherit the former guard rather than losing it.
+        threshold = (old_setting if SETTING in metadata else
+                     validate_threshold(math.ceil(max(floor + reserve, previous))))
+        # Write the replacement protection FIRST. Partial failure stays fail-closed.
+        r.atomic_json(job / "job.json", {**metadata, SETTING: threshold})
+        r.atomic_json(guard_path, {**guard, "enabled": False, "manual_resume": {
+            "requested_at": r.now_iso(), "previous_setting": old_setting,
+            "remaining_percent_threshold": threshold,
+            "reason": "Явный ручной запуск после остановки кампании пользователем; выбранный порог сохранён, при отсутствии настройки унаследован порог кампании.",
+        }})
+        return threshold
+
+
 def stalled_run(job: Path, run: dict, now: float) -> bool:
     runtime_path = job / "workers-runtime.json"
     runtime = r.read_json(runtime_path) if runtime_path.exists() else {}

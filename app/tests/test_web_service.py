@@ -55,6 +55,33 @@ def test_web_percentage_setting_is_validated_and_never_launches(monkeypatch, tmp
     assert not (job / "control.json").exists()
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_web_start_is_explicit_and_restores_pause_on_failure(monkeypatch, tmp_path, fail):
+    job = make_web_job(tmp_path)
+    queue.atomic_write_json(job / "control.json", {
+        "priority_marker_ids": ["marker-1"], "manual_queue_requested": True, "pause_requested": True,
+    })
+    before = (job / "decisions.jsonl").read_bytes()
+    calls = []
+    def launch(selected, app, *, manual_start=False):
+        calls.append((selected, manual_start))
+        if fail:
+            raise RuntimeError("Quota guard still blocks")
+        return {"runner_pid": 123, "resume_notice": "Preserved 60% quota threshold"}
+    monkeypatch.setattr(web, "launch_runner", launch)
+    client, csrf = authenticated_client(monkeypatch, tmp_path)
+    with client:
+        job_id = client.get("/api/jobs").json()["jobs"][0]["id"]
+        response = client.post(f"/api/jobs/{job_id}/start", json={}, headers={"X-CSRF-Token": csrf})
+        assert response.status_code == (400 if fail else 200), response.text
+        if not fail:
+            assert response.json()["run"]["resume_notice"]
+    assert calls == [(job, True)]
+    assert queue.pause_requested(job / "decisions.jsonl") is fail
+    assert queue.priority_marker_ids(job / "decisions.jsonl") == ["marker-1"]
+    assert (job / "decisions.jsonl").read_bytes() == before
+
+
 def authenticated_client(monkeypatch, tmp_path: Path) -> tuple[TestClient, str]:
     monkeypatch.setenv("SVACER_WEB_TOKEN", "w" * 48)
     monkeypatch.setenv("SVACER_COOKIE_SECURE", "0")

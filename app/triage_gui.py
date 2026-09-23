@@ -3736,7 +3736,7 @@ class TriageGui:
         })
         atomic_json(control_path, control)
         try:
-            launched = launch_runner(self.job, self.app_directory)
+            launched = launch_runner(self.job, self.app_directory, manual_start=True)
         except Exception as exc:
             control["pause_requested"] = True
             control["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -3750,7 +3750,8 @@ class TriageGui:
         pid = launched.get("codex_pid") or launched.get("runner_pid")
         self.set_message(
             f"Выбранный маркер поставлен единственным в следующую выдачу. "
-            f"Codex работает автоматически в фоне (PID {pid})."
+            f"Codex работает автоматически в фоне (PID {pid}). "
+            + launched.get("resume_notice", "")
         )
 
     def check_connection(self, *, auto_retry: bool = False) -> None:
@@ -3871,7 +3872,7 @@ class TriageGui:
 
         set_pause(self.job, False)
         try:
-            launched = launch_runner(self.job, self.app_directory)
+            launched = launch_runner(self.job, self.app_directory, manual_start=True)
         except Exception as exc:
             set_pause(self.job, True)
             self.set_message(f"Не удалось запустить Codex: {exc}", error=True)
@@ -3885,7 +3886,8 @@ class TriageGui:
         else:
             self.set_message(
                 f"Codex запущен автоматически в фоне (PID {pid}). "
-                "Промпт сохранён в задаче; окно можно закрыть."
+                "Промпт сохранён в задаче; окно можно закрыть. "
+                + launched.get("resume_notice", "")
             )
         self.refresh()
 

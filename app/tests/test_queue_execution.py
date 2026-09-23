@@ -1048,11 +1048,12 @@ def test_runtime_prompt_separates_component_defect_from_product_reachability(tmp
 def test_runtime_prompt_requires_publication_ready_comments_without_hiding_gaps(tmp_path):
     job = make_job(tmp_path)
     prompt = runner.build_runtime_prompt(job, tmp_path, claim(job))
-    assert "проверенный факт, причина статуса и ссылка" in prompt
+    assert "самодостаточным для проверяющего: что проверено" in prompt
+    assert "почему из них следует вердикт" in prompt
     assert "Не добавляй служебные оговорки" in prompt
     assert "Не скрывай пробелы доказательств" in prompt
     assert "needs_context, а не подменяй их готовым вердиктом" in prompt
-    assert "обычно 2–4 коротких предложения" in prompt
+    assert "обычно 4–6 предложений" in prompt
     assert "без Markdown-ссылок, обратных кавычек и заголовков" in prompt
     assert "Пример только стиля, НЕ доказательство" in prompt
     assert "Не копируй этот вывод" in prompt

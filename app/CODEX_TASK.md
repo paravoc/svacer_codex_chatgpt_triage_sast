@@ -383,11 +383,25 @@ Allowed verdicts:
   not to fix it is proven;
 - `Unclear`: one or more precise evidence gaps remain.
 
-The Russian `comment` must be concise and evidence-based: one paragraph, usually 2-4 short sentences,
+The Russian `comment` must be concise and evidence-based: one paragraph, usually 4-6 sentences,
 30-1800 characters, and at least one verified `file:line`. Do not prefix it with the
 verdict name because Svacer stores status separately.
-Write a publication-ready explanation: checked fact, reason for the status, source
-reference. Explain it naturally to a developer: what the code does, the decisive
+Make the explanation self-contained for a reviewer: what was checked -> decisive
+conditions or protection -> why the verdict follows -> source locations. First connect
+the reported operation to its call or value origin, explain the relevant branches,
+guards and state changes, then conclude about that operation. Do not merely assert
+"there is a check" or "double close is impossible"; name the condition and its effect.
+For False Positive, explain why the dangerous state cannot occur on the relevant paths.
+When multiple methods matter, cover the protection in each; for concurrency, say what
+the shared mutex protects and why the state check and update are synchronized.
+For Confirmed, state reachable input conditions, the violated check and proven consequence.
+For Won't fix, state the concrete reason not to fix; an authorized scope exclusion is
+not proof that no defect exists. Include bounds, sizes, lifetime or build parameters only
+when decisive. Do not require a product call graph for a proven caller-independent invariant.
+Support each decisive claim with verified `source_evidence` and place short citations
+next to the corresponding explanation. The 4-6 sentences are guidance, not a minimum:
+a simple proof may be shorter. Never omit an essential guard for brevity or add speculation
+to fill space. Explain it naturally to a developer: what the code does, the decisive
 condition, and the conclusion. Do not narrate the entire investigation or mix English
 jargon into Russian prose: use "метод GetName()", "вызов на nil", "подключение к продукту"
 instead of "Protobuf getter", "nil receiver", "product wiring". Keep identifiers unchanged.
@@ -402,8 +416,10 @@ Use plain text in `comment`: no Markdown links, backticks, or headings. Cite sho
 `file:line` locations; add a repository-relative path if filenames are ambiguous.
 Keep absolute build/cache paths, revisions, and long quotations in `source_evidence`.
 Style-only example, NOT evidence for the current marker:
-"Перед чтением поля указатель проверяется на nil. При nil функция возвращает пустую строку
-(reader.go:42–46), поэтому до разыменования выполнение не доходит."
+"Полученное значение передаётся в readName() (reader.go:20–24). До чтения поля name
+функция проверяет указатель: при nil сразу возвращает пустую строку (reader.go:42–46).
+Между этой проверкой и обращением к полю указатель не изменяется (reader.go:42–48).
+Поэтому по указанному пути nil не достигает разыменования."
 Do not copy that conclusion: use only facts and references verified for this marker.
 Do not add internal policy disclaimers such as "this decision does not
 assert the tool's safety", agent workflow details, or approval-process narration.

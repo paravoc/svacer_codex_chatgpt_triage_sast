@@ -1309,7 +1309,7 @@ def recover_completed_worker_result(job: Path, context: dict[str, Any], assignme
     return None
 
 
-TRIAGE_PROMPT_VERSION = "2026-09-23.4"
+TRIAGE_PROMPT_VERSION = "2026-09-23.5"
 
 
 def _runtime_work_contract() -> str:
@@ -1564,10 +1564,26 @@ proof_gaps и уже проверенные факты/цитаты. Не зап
 ## Комментарий для разработчика
 Пиши аналитические поля и итоговый comment кратко на русском. Имена JSON-полей,
 значения verdict, пути, символы и цитаты кода оставляй без перевода. Поле comment — один абзац,
-обычно 2–4 коротких предложения по-русски, 30–1800 символов, минимум одна проверенная ссылка файл:строка из
+обычно 4–6 предложений по-русски, 30–1800 символов, минимум одна проверенная ссылка файл:строка из
 source_evidence. Не начинай comment с названия вердикта. Неудачные поиски, предположения и просьбы
 о дополнительной проверке относятся к needs_context, а не к готовому комментарию.
-Комментарий предназначен для разметки Svacer: проверенный факт, причина статуса и ссылка.
+Комментарий должен быть самодостаточным для проверяющего: что проверено → решающие условия
+или защита → почему из них следует вердикт → ссылки на строки. Не ограничивайся фразой
+«есть проверка» или «повторное закрытие невозможно»: покажи конкретное условие и его действие.
+Сначала свяжи место срабатывания с вызовом или происхождением значения. Затем укажи важные
+ветви, проверки и изменения состояния; заверши выводом именно о проверяемой операции.
+Для False Positive объясни, почему опасное состояние недостижимо на релевантных путях.
+Если вывод зависит от нескольких методов, покажи защиту в каждом из них; при конкуренции —
+что именно защищает общий мьютекс и почему проверка и изменение состояния согласованы.
+Для Confirmed назови достижимые входные условия, нарушенную проверку и доказанное последствие.
+Для Won't fix укажи конкретное основание отказа от исправления; исключение из области
+не выдавай за отсутствие дефекта. Размеры, диапазоны, lifetime и параметры сборки добавляй,
+только если они определяют вывод. Не требуй продуктовый call graph для доказанного,
+не зависящего от вызывающего кода инварианта; не добавляй предположения ради подробности.
+Каждое решающее утверждение подкрепляй проверенными фактами из source_evidence и ставь
+короткую ссылку рядом с соответствующим объяснением, а не только в конце абзаца.
+4–6 предложений — ориентир, не требование объёма: простое доказательство можно изложить
+короче. Не убирай существенную защиту или условие ради краткости и не добавляй воду.
 Пиши естественно, как разработчику: что происходит в коде, какое условие решает вопрос и почему.
 Не пересказывай всё исследование. Вместо «Protobuf getter», «nil receiver», «product wiring»
 используй понятные русские слова: «метод GetName()», «вызов на nil», «подключение к продукту».
@@ -1582,8 +1598,10 @@ source_evidence. Не начинай comment с названия вердикт�
 Пиши короткие ссылки файл:строка; при совпадении имён добавляй путь внутри репозитория.
 Полные пути /root/.cache/bazel/..., ревизии и длинные цитаты оставляй в source_evidence.
 Пример только стиля, НЕ доказательство для текущего маркера:
-«Перед чтением поля указатель проверяется на nil. При nil функция возвращает пустую строку
-(reader.go:42–46), поэтому до разыменования выполнение не доходит.»
+«Полученное значение передаётся в readName() (reader.go:20–24). До чтения поля name
+функция проверяет указатель: при nil сразу возвращает пустую строку (reader.go:42–46).
+Между этой проверкой и обращением к полю указатель не изменяется (reader.go:42–48).
+Поэтому по указанному пути nil не достигает разыменования.»
 Не копируй этот вывод: факты и ссылки бери только из проверенного кода текущего маркера.
 Не добавляй служебные оговорки вроде «безопасность этим решением не утверждается», описание
 работы агента или процесса согласования. Для исключения из области укажи конкретный компонент
@@ -1872,22 +1890,22 @@ def _acquire_launch_lock(job: Path) -> int:
         raise RuntimeError("Запуск анализа уже выполняется. Подождите несколько секунд.")
 
 
-def launch_runner(job: Path, app_directory: Path) -> dict[str, Any]:
+def launch_runner(job: Path, app_directory: Path, *, manual_start: bool = False) -> dict[str, Any]:
     """Start one detached runner, refusing a duplicate coordinator for the job."""
     from local_jobs import job_operation_lock
     try:
         with job_operation_lock(job), decision_lock(job / "decisions.jsonl"):
-            return _launch_runner_locked(job, app_directory)
+            return _launch_runner_locked(job, app_directory, manual_start=manual_start)
     except SystemExit as exc:
         raise RuntimeError(str(exc)) from exc
 
 
-def _launch_runner_locked(job: Path, app_directory: Path) -> dict[str, Any]:
+def _launch_runner_locked(job: Path, app_directory: Path, *, manual_start: bool = False) -> dict[str, Any]:
     job = job.resolve()
     _job_paths(job)
     from analysis_campaign import lease_reason
     guard_reason = lease_reason(job)
-    if guard_reason:
+    if guard_reason and not manual_start:
         raise RuntimeError(guard_reason)
     job_data = read_json(job / "job.json")
     requested_model = normalize_codex_model(job_data.get("codex_model"))
@@ -1903,8 +1921,19 @@ def _launch_runner_locked(job: Path, app_directory: Path) -> dict[str, Any]:
             if not pending_verification:
                 raise RuntimeError("Очередь пуста. Выберите маркеры на вкладке «Маркеры» и добавьте их в очередь.")
 
+        resumed = {}
+        if guard_reason and manual_start:
+            from analysis_campaign import release_user_stop_for_manual_start
+            threshold = release_user_stop_for_manual_start(job)
+            if threshold is not None:
+                resumed = {"manual_resume_threshold": threshold, "resume_notice": (
+                    "Прежняя автокампания остаётся остановленной. " + usage_guard.display_text(threshold) + ".")}
+        guard_reason = lease_reason(job)
+        if guard_reason:
+            raise RuntimeError(guard_reason)
         launch_id = str(uuid.uuid4())
         atomic_json(job / RUN_FILE, {
+            **resumed,
             "status": "launching",
             "active": True,
             "launch_id": launch_id,
@@ -1932,6 +1961,7 @@ def _launch_runner_locked(job: Path, app_directory: Path) -> dict[str, Any]:
             record["runner_pid"] = process.pid
             atomic_json(job / RUN_FILE, record)
         return {
+            **resumed,
             "status": "launching",
             "active": True,
             "launch_id": launch_id,

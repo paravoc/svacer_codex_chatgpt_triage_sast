@@ -81,6 +81,40 @@ def test_publication_style_and_boolean_fields_are_explicit(tmp_path):
     assert "panic()/recover()" in prompt
 
 
+@pytest.mark.parametrize("repair", [False, True])
+def test_reviewer_comment_explains_decisive_guards_without_changing_results(tmp_path, repair):
+    job = make_job(tmp_path, count=1)
+    context = claim(job)
+    if repair:
+        context.update(worker_quality_repair_count=1, quality_feedback=["Clarify the checked guard"])
+    before = {p.relative_to(job): p.read_bytes() for p in job.rglob("*") if p.is_file()}
+    prompt = runner.build_runtime_prompt(job, tmp_path, context)
+    assert "самодостаточным для проверяющего" in prompt
+    assert "обычно 4–6 предложений" in prompt
+    assert "ориентир, не требование объёма" in prompt
+    assert "покажи защиту в каждом из них" in prompt
+    assert "что именно защищает общий мьютекс" in prompt
+    assert "Для Confirmed назови достижимые входные условия" in prompt
+    assert "Для Won't fix укажи конкретное основание" in prompt
+    assert "Каждое решающее утверждение подкрепляй проверенными фактами" in prompt
+    assert "Не требуй продуктовый call graph" in prompt
+    assert "Пример только стиля, НЕ доказательство" in prompt
+    assert "Не копируй этот вывод" in prompt
+    assert "Если поправил только оформление, не начинай весь анализ заново" in prompt
+    assert {p.relative_to(job): p.read_bytes() for p in job.rglob("*") if p.is_file()} == before
+
+
+def test_manual_and_runtime_comment_guidance_use_the_same_example():
+    app = Path(__file__).resolve().parents[1]
+    manual = (app / "CODEX_TASK.md").read_text(encoding="utf-8-sig")
+    runtime = (app / "codex_run.py").read_text(encoding="utf-8-sig")
+    assert "usually 4-6 sentences" in manual
+    assert "guidance, not a minimum" in manual
+    example = "Между этой проверкой и обращением к полю указатель не изменяется (reader.go:42–48)."
+    assert example in manual and example in runtime
+    assert f"`{runner.TRIAGE_PROMPT_VERSION}`" in (app.parent / "docs" / "PROMPTING.md").read_text(encoding="utf-8-sig")
+
+
 @pytest.mark.parametrize("invalid", [None, "false", 0])
 def test_missing_or_mistyped_axes_get_format_feedback_not_invented_values(tmp_path, invalid):
     import copy

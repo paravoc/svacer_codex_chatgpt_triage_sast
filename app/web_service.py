@@ -439,7 +439,11 @@ async def api_start(request: Request) -> Response:
         if not priority_marker_ids(job / "decisions.jsonl"):
             raise ValueError("Очередь пуста. Выберите маркеры перед запуском.")
         set_pause(job, False)
-        launched = launch_runner(job, APP_DIRECTORY)
+        try:
+            launched = launch_runner(job, APP_DIRECTORY, manual_start=True)
+        except Exception:
+            set_pause(job, True)
+            raise
         return JSONResponse({"ok": True, "run": launched})
     return await guarded(request, action, mutation=True)
 

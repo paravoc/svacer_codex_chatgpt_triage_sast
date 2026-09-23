@@ -47,6 +47,14 @@ that risk but cannot mathematically guarantee an account-wide percentage floor.
   15 minutes, the supervisor requests a stop and permits one bounded restart.
 - A user-requested immediate or graceful stop is respected. Queue removal or a changed
   launch is not permission to expand the automatic campaign.
+  A later explicit desktop/web Start can detach that one idle job from a `user_stopped`
+  campaign after its supervisor exits. The campaign itself remains stopped. Its stop
+  threshold (60% in the example above) is transferred only if the job has no percentage
+  setting yet; an existing user setting, including 0/off, is kept for the new manual run.
+  The UI reports the resulting setting. The old guard is
+  retained with a manual-resume audit, not deleted. The new runner checks fresh quota
+  before model work and throughout analysis. Automatic retries, quota/error stops,
+  unknown campaign state and live supervisors cannot use this handover.
 - An empty queue is not completion if its selected markers still lack results or have
   a challenged verification. Those records remain `needs_attention`.
 

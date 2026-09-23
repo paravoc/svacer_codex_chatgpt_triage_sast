@@ -2738,7 +2738,7 @@ class TriageQtWindow(QMainWindow):
         })
         atomic_json(control_path, control)
         try:
-            launched = launch_runner(self.job, self.app_directory)
+            launched = launch_runner(self.job, self.app_directory, manual_start=True)
         except Exception as exc:
             control["pause_requested"] = True
             control["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -2750,7 +2750,14 @@ class TriageQtWindow(QMainWindow):
         self._table_signatures.pop("queue", None)
         self.refresh()
         pid = launched.get("codex_pid") or launched.get("runner_pid")
-        self.set_message(f"Выбранный маркер поставлен в отдельный запуск (PID {pid}).")
+        self.show_manual_resume_notice(launched, f"Выбранный маркер поставлен в отдельный запуск (PID {pid}).")
+
+    def show_manual_resume_notice(self, launched: dict, message: str) -> None:
+        threshold = launched.get("manual_resume_threshold")
+        if threshold is not None:
+            self.job_data["codex_min_remaining_percent"] = threshold
+            self.usage_stop_input.setValue(threshold)
+        self.set_message(" ".join(filter(None, (message, launched.get("resume_notice")))))
 
     def selected_job(self) -> Path | None:
         row = self.jobs_table.currentRow()
@@ -2883,7 +2890,7 @@ class TriageQtWindow(QMainWindow):
             return
         set_pause(self.job, False)
         try:
-            launched = launch_runner(self.job, self.app_directory)
+            launched = launch_runner(self.job, self.app_directory, manual_start=True)
         except Exception as exc:
             set_pause(self.job, True)
             self.set_message(f"Не удалось запустить Codex: {exc}", error=True)
@@ -2891,7 +2898,7 @@ class TriageQtWindow(QMainWindow):
             return
         self.refresh()
         pid = launched.get("codex_pid") or launched.get("runner_pid")
-        self.set_message(f"Анализ запущен в фоне (PID {pid}). Окно можно закрыть.")
+        self.show_manual_resume_notice(launched, f"Анализ запущен в фоне (PID {pid}). Окно можно закрыть.")
 
     def reset_current_queue(self) -> None:
         if read_run_record(self.job).get("active"):

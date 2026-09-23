@@ -65,6 +65,22 @@ def table_ids(widget):
     return [widget.item(row, 0).data(ui.Qt.ItemDataRole.UserRole) for row in range(widget.rowCount())]
 
 
+def test_start_button_explicitly_resumes_and_displays_preserved_quota(manual_window, monkeypatch):
+    window, job, _, ids, _ = manual_window
+    (job / "START_PROMPT.txt").write_text("offline prompt", encoding="utf-8")
+    atomic_json(job / "control.json", {"priority_marker_ids": ids[:2], "pause_requested": True})
+    calls = []
+    def launch(selected, app, *, manual_start=False):
+        calls.append((selected, manual_start))
+        return {"runner_pid": 123, "manual_resume_threshold": 60, "resume_notice": "Порог остатка 60% сохранён."}
+    monkeypatch.setattr(ui, "launch_runner", launch)
+    window.analysis_action()
+    assert calls == [(job, True)]
+    assert window.usage_stop_input.value() == 60
+    assert "60%" in window.status.text() and "запущен" in window.status.text()
+    assert queue.priority_marker_ids(job / "decisions.jsonl") == ids[:2]
+
+
 def test_model_and_parallel_capacity_are_visible_next_to_start(manual_window, tmp_path):
     window, job, run, ids, app = manual_window
     font = Path("C:/Windows/Fonts/segoeui.ttf")
