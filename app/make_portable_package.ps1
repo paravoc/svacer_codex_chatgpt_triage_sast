@@ -26,7 +26,7 @@ $appFiles = @(
     'start_svacer_stdio.py', 'start_svacer_mcp.ps1',
     'desktop_theme.py', 'marker_history.py', 'marker_notifications.py', 'decision_quality.py', 'comment_format.py', 'import_selection.py',
     'triage_gui.ps1', 'triage_gui.cmd', 'codex_run.py',
-    'parallel_analysis.py', 'continuous_analysis.py', 'analysis_scope.py', 'analysis_campaign.py',
+    'parallel_analysis.py', 'continuous_analysis.py', 'analysis_scope.py', 'analysis_campaign.py', 'usage_guard.py',
     'dependency_sources.py', 'investigation.py', 'result_transport.py', 'source_inspect.py', 'web_research.py',
     'make_portable_package.ps1', 'make_portable_package.cmd',
     'triage_queue.py', 'local_jobs.py', 'project_setup.py', 'project_setup_qt.py',

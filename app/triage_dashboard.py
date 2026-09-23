@@ -364,6 +364,12 @@ def collect_state(job: Path) -> dict:
     runtime = read_worker_runtime(job)
     if runtime.get("batch") == current_batch:
         state["worker_runtime"] = runtime
+    from usage_guard import SETTING, snapshot, validate_threshold
+    state["usage_guard"] = snapshot(job)
+    try:
+        state[SETTING] = validate_threshold(read_json(job_path).get(SETTING, 0)) if job_path.exists() else 0
+    except (OSError, ValueError, TypeError, AttributeError):
+        state[SETTING] = 0
     return state
 
 

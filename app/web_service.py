@@ -307,6 +307,8 @@ def public_state(job: Path) -> dict[str, Any]:
     state["by_verdict"] = dict(state.get("by_verdict") or {})
     state["verification"] = dict(state.get("verification") or {})
     state["codex_run"] = read_run_record(job)
+    from usage_guard import SETTING, display_text
+    state["usage_guard_text"] = display_text(state.get(SETTING, 0))
     return state
 
 
@@ -448,6 +450,21 @@ async def api_stop(request: Request) -> Response:
     return await guarded(request, action, mutation=True)
 
 
+async def api_usage_limit(request: Request) -> Response:
+    async def action() -> Response:
+        from usage_guard import SETTING, validate_threshold
+        from triage_queue import decision_lock, atomic_write_json
+        job = selected_job(request.path_params["job_id"])
+        body = await json_body(request)
+        threshold = validate_threshold(body.get(SETTING))
+        with decision_lock(job / "decisions.jsonl"):
+            metadata = read_json(job / "job.json")
+            metadata[SETTING] = threshold
+            atomic_write_json(job / "job.json", metadata)
+        return JSONResponse({"ok": True, SETTING: threshold})
+    return await guarded(request, action, mutation=True)
+
+
 async def api_refs(request: Request) -> Response:
     async def action() -> Response:
         body = await json_body(request)
@@ -527,6 +544,7 @@ routes = [
     Route("/api/jobs/{job_id}/dequeue", api_dequeue, methods=["POST"]),
     Route("/api/jobs/{job_id}/start", api_start, methods=["POST"]),
     Route("/api/jobs/{job_id}/stop", api_stop, methods=["POST"]),
+    Route("/api/jobs/{job_id}/usage-limit", api_usage_limit, methods=["POST"]),
     Route("/api/jobs/{job_id}/import/preview", api_import_preview, methods=["POST"]),
     Route("/api/jobs/{job_id}/import/apply", api_import_apply, methods=["POST"]),
 ]

@@ -127,6 +127,7 @@ QFrame#card { background: #1b1e23; border: 1px solid #323842; border-radius: 12p
 QFrame#subcard { background: #20242b; border: 1px solid #323842; border-radius: 10px; }
 QFrame#notificationPanel { background: #191e24; border: 1px solid #46505b; border-radius: 13px; }
 QScrollArea#notificationScroll { background: transparent; border: 0; }
+QScrollArea#settingsScroll, QWidget#settingsBody { background: #111317; border: 0; }
 QPushButton#notificationDismissAll { color: #b7c7d7; background: #2a3139; border: 1px solid #46505b; border-radius: 7px; padding: 5px 9px; }
 QPushButton#notificationDismissAll:hover { color: #f1f7fd; background: #3a4754; border-color: #79a3c2; }
 QPushButton#notificationDismissAll:pressed { background: #25313c; }
@@ -861,8 +862,9 @@ class TriageQtWindow(QMainWindow):
         self.scope = label("", "muted")
         self.run_status = label("", "muted")
         self.usage = label("", "muted")
+        self.usage_stop_status = label("", "muted")
         self.codex_limit = label("Доступно Codex: получаю данные…", "muted")
-        for widget in (self.scope, self.run_status, self.usage, self.codex_limit):
+        for widget in (self.scope, self.run_status, self.usage, self.codex_limit, self.usage_stop_status):
             widget.setWordWrap(True)
             body.addWidget(widget)
         self.progress = QProgressBar()
@@ -1056,7 +1058,16 @@ class TriageQtWindow(QMainWindow):
         detail_box.addWidget(self.history_detail)
 
     def build_settings(self) -> None:
-        layout = QVBoxLayout(self.settings_tab)
+        outer = QVBoxLayout(self.settings_tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        body.setObjectName("settingsBody")
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 9, 0, 0)
         heading, box = card(sub=True)
         box.addWidget(label("Параметры анализа", "section"))
@@ -1075,6 +1086,25 @@ class TriageQtWindow(QMainWindow):
         box.addWidget(self.capacity_hint)
         self.workers.valueChanged.connect(self.update_capacity_preview)
         layout.addWidget(capacity)
+        quota_card, box = card()
+        box.addWidget(label("Останавливать при остатке Codex", "section"))
+        self.usage_stop_input = QSpinBox()
+        self.usage_stop_input.setRange(0, 99)
+        self.usage_stop_input.setSuffix(" %")
+        self.usage_stop_input.setSpecialValueText("Отключено")
+        self.usage_stop_input.setAccessibleName("Останавливать при остатке Codex, процентов")
+        box.addWidget(self.usage_stop_input)
+        quota_hint = label(
+            "Например, 20%: остановить анализ, когда доступно 20% или меньше. 0 — отключено. "
+            "Это остаток лимита аккаунта, а не бюджет токенов на запуск. "
+            "Проверка перед запуском и каждые 15 секунд, в том числе при закрытом окне. "
+            "Изменение действует со следующей проверки; автоматического возобновления нет. "
+            "Готовые результаты, черновики и очередь сохраняются. При недоступном лимите анализ останавливается. "
+            "Порог не гарантирует точный остаток: учёт расхода может запаздывать. "
+            "Более строгая защита активной автоматической кампании остаётся в силе.", "muted")
+        quota_hint.setWordWrap(True)
+        box.addWidget(quota_hint)
+        layout.addWidget(quota_card)
         model_card, box = card()
         box.addWidget(label("Модель Codex для анализа", "section"))
         model_row = QHBoxLayout()
@@ -1346,6 +1376,8 @@ class TriageQtWindow(QMainWindow):
             usage = run.get("usage") if isinstance(run.get("usage"), dict) else read_codex_usage(self.job)
             total_tokens = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
             self.usage.setText(f"Фактический расход: {format_count(total_tokens)} токенов")
+            from usage_guard import SETTING, display_text
+            self.usage_stop_status.setText(display_text(state.get(SETTING, 0)))
             self.refresh_codex_limit_if_needed()
             self.load_markers()
             self.apply_job_rows(
@@ -2301,6 +2333,7 @@ class TriageQtWindow(QMainWindow):
 
     def load_settings_form(self) -> None:
         self.workers.setValue(int(self.job_data.get("parallel_workers") or 1))
+        self.usage_stop_input.setValue(int(self.job_data.get("codex_min_remaining_percent") or 0))
         self.populate_model_options(str(self.job_data.get("codex_model") or ""))
         from analysis_scope import FULL_SCOPE
         scope_index = self.analysis_scope_combo.findData(self.job_data.get("analysis_scope", FULL_SCOPE))
@@ -2390,6 +2423,7 @@ class TriageQtWindow(QMainWindow):
                 "manual_selection_only": True,
                 "codex_model": selected_model or "",
                 "analysis_scope": selected_scope,
+                "codex_min_remaining_percent": self.usage_stop_input.value(),
             })
             # Leave legacy fields untouched for an already-running coordinator
             # that may still have the previous code loaded in memory.
@@ -2406,6 +2440,7 @@ class TriageQtWindow(QMainWindow):
             self.set_message(
                 f"Настройки сохранены: агентов {workers}, модель {selected_model or 'по умолчанию Codex'}. "
                 f"{activation} В работу попадут только маркеры, которые вы добавили в очередь."
+                " Порог остатка Codex действует со следующей проверки (до 15 секунд); старому процессу нужен перезапуск."
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self.set_message(f"Не удалось сохранить настройки: {exc}", error=True)
@@ -3100,6 +3135,7 @@ class TriageQtWindow(QMainWindow):
         self.scope.setText("Создайте новый проект или обновите список задач.")
         self.run_status.setText("")
         self.usage.setText("")
+        self.usage_stop_status.setText("")
         self.progress_text.setText("0 из 0")
         self.set_preparation_indicator("")
         self.progress.setRange(0, 1)

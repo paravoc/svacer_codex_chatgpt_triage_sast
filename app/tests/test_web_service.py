@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import pytest
 from pathlib import Path
 
 from starlette.testclient import TestClient
@@ -29,6 +30,29 @@ def make_web_job(tmp_path: Path) -> Path:
     })
     queue.atomic_write_jsonl(job / "decisions.jsonl", [queue.new_pending_decision(marker)])
     return job
+
+
+def test_web_percentage_setting_is_validated_and_never_launches(monkeypatch, tmp_path):
+    job = make_web_job(tmp_path)
+    client, csrf = authenticated_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web, "launch_runner", lambda *args: pytest.fail("Saving settings must not launch"))
+    before = (job / "decisions.jsonl").read_bytes()
+    with client:
+        job_id = client.get("/api/jobs").json()["jobs"][0]["id"]
+        url = f"/api/jobs/{job_id}/usage-limit"
+        assert client.post(url, json={"codex_min_remaining_percent": 20}).status_code == 401
+        for value in (-1, 100, 20.1, "20", True, None):
+            response = client.post(url, json={"codex_min_remaining_percent": value}, headers={"X-CSRF-Token": csrf})
+            assert response.status_code == 400, response.text
+        for value in (20, 0):
+            response = client.post(url, json={"codex_min_remaining_percent": value}, headers={"X-CSRF-Token": csrf})
+            assert response.status_code == 200, response.text
+            assert web.read_json(job / "job.json")["codex_min_remaining_percent"] == value
+            state = client.get(f"/api/jobs/{job_id}").json()["state"]
+            assert state["codex_min_remaining_percent"] == value
+            assert state["usage_guard_text"]
+    assert (job / "decisions.jsonl").read_bytes() == before
+    assert not (job / "control.json").exists()
 
 
 def authenticated_client(monkeypatch, tmp_path: Path) -> tuple[TestClient, str]:

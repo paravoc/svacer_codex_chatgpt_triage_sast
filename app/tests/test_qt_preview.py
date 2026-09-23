@@ -409,11 +409,15 @@ def test_four_tabs_queue_and_card_render_without_side_effects(tmp_path: Path, mo
         window.model_combo.setCurrentIndex(window.model_combo.findData("gpt-6-astra"))
         assert window.analysis_scope_combo.currentData() == "product_and_tooling"
         window.analysis_scope_combo.setCurrentIndex(window.analysis_scope_combo.findData("shipped_product"))
+        window.usage_stop_input.setValue(20)
         window.save_execution_settings()
+        assert json.loads((job / "job.json").read_text(encoding="utf-8"))["codex_min_remaining_percent"] == 20
         assert json.loads((job / "job.json").read_text(encoding="utf-8"))["codex_model"] == "gpt-6-astra"
         assert json.loads((job / "job.json").read_text(encoding="utf-8"))["analysis_scope"] == "shipped_product"
         window.load_settings_form()
         assert window.model_combo.currentData() == "gpt-6-astra"
+        assert window.usage_stop_input.value() == 20
+        assert "≤ 20%" in window.usage_stop_status.text()
         assert window.analysis_scope_combo.currentData() == "shipped_product"
         with monkeypatch.context() as running:
             running.setattr(qt_gui, "read_run_record", lambda _: {"active": True})

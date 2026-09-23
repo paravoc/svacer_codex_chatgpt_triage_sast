@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import usage_guard
 from marker_history import append_batch_history, read_turn_observability
 from web_research import codex_web_config, public_research_prompt
 from decision_quality import (
@@ -1962,6 +1963,8 @@ def _append_runner_event(job: Path, event_type: str, **payload: Any) -> None:
 
 
 def _stop_requested(job: Path, launch_id: str) -> bool:
+    if usage_guard.stop_reason(job, launch_id):
+        return True
     from analysis_campaign import lease_reason
     if lease_reason(job):
         return True
@@ -2114,7 +2117,9 @@ def _run_one_codex_turn(
         )
         if _stop_requested(job, launch_id):
             stop_run(job)
-        exit_code = process.wait() if process.stdin is None else _send_prompt(process, prompt)
+        should_stop = lambda: _stop_requested(job, launch_id)
+        exit_code = (_wait_for_codex(process, should_stop=should_stop) if process.stdin is None
+                     else _send_prompt(process, prompt, should_stop=should_stop))
     if exit_code == 0:
         from result_transport import read_final_reply
         reply = read_final_reply(reply_path, context["batch"]["marker_ids"])
@@ -2300,6 +2305,7 @@ def run_job(job: Path, launch_id: str) -> int:
     job = job.resolve()
     started_at = now_iso()
     last_pid: int | None = None
+    guard = None
     try:
         tool_directory, prompt_path = _job_paths(job)
         if not prompt_path.read_text(encoding="utf-8-sig").strip():
@@ -2307,6 +2313,9 @@ def run_job(job: Path, launch_id: str) -> int:
         job_data = read_json(job / "job.json")
         if not isinstance(job_data, dict):
             raise ValueError("job.json имеет неверный формат.")
+        guard = usage_guard.UsageGuard(job, launch_id, read_codex_rate_limits).start()
+        if guard.reason:
+            raise IncompleteAnalysisError(guard.reason)
         # Keep prior session events: the GUI can show cumulative token usage and
         # reopening the application does not erase diagnostic history.
         _append_runner_event(job, "triage.run.started", launch_id=launch_id)
@@ -2511,6 +2520,8 @@ def run_job(job: Path, launch_id: str) -> int:
             status = "incomplete"
             reason += f" Маркеров для доисследования: {incomplete_attempts}; остальные результаты сохранены."
             exit_code = 3
+        if guard.reason:
+            status, reason, exit_code = "paused", guard.reason, 0
         usage = read_codex_usage(job, launch_id)
         atomic_json(job / RUN_FILE, {
             "status": status,
@@ -2525,22 +2536,25 @@ def run_job(job: Path, launch_id: str) -> int:
             "phase": status,
             "phase_detail": reason,
             "usage": usage,
+            "stop_kind": "codex_percentage" if guard.reason else "",
             "event_log": EVENT_LOG,
             "error_log": ERROR_LOG,
         })
         return exit_code
     except (Exception, SystemExit) as exc:
+        quota_reason = guard.reason if guard is not None else ""
         atomic_json(job / RUN_FILE, {
-            "status": "failed",
+            "status": "paused" if quota_reason else "failed",
             "active": False,
             "launch_id": launch_id,
             "started_at": started_at,
             "finished_at": now_iso(),
             "runner_pid": os.getpid(),
             "codex_pid": None,
-            "reason": str(exc),
-            "phase": "failed",
-            "phase_detail": str(exc),
+            "reason": quota_reason or str(exc),
+            "phase": "paused" if quota_reason else "failed",
+            "phase_detail": quota_reason or str(exc),
+            "stop_kind": "codex_percentage" if quota_reason else "",
             "event_log": EVENT_LOG,
             "error_log": ERROR_LOG,
         })
@@ -2549,19 +2563,22 @@ def run_job(job: Path, launch_id: str) -> int:
                 stderr.write(f"[{now_iso()}] Ошибка запуска: {exc}\n")
         except OSError:
             pass
-        return 1
+        return 0 if quota_reason else 1
+    finally:
+        if guard is not None:
+            guard.close()
 
 
-def _send_prompt(process: subprocess.Popen[str], prompt: str) -> int:
+def _send_prompt(process: subprocess.Popen[str], prompt: str, *, should_stop=None) -> int:
     assert process.stdin is not None
     try:
         process.stdin.write(prompt)
         process.stdin.write("\n")
         process.stdin.close()
         process.stdin = None
-        return _wait_for_codex(process)
+        return _wait_for_codex(process, should_stop=should_stop) if should_stop else _wait_for_codex(process)
     except (BrokenPipeError, OSError):
-        return _wait_for_codex(process)
+        return _wait_for_codex(process, should_stop=should_stop) if should_stop else _wait_for_codex(process)
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
@@ -2591,8 +2608,20 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
 
 def _wait_for_codex(
     process: subprocess.Popen[str], timeout: int = CODEX_TURN_TIMEOUT_SECONDS,
+    *, should_stop=None,
 ) -> int:
     try:
+        if should_stop is not None:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if should_stop():
+                    _terminate_process_tree(process)
+                    return -1
+                try:
+                    return process.wait(timeout=min(.25, max(.01, deadline - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    continue
+            raise subprocess.TimeoutExpired(process.args, timeout)
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         _terminate_process_tree(process)

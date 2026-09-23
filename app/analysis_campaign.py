@@ -182,6 +182,9 @@ class Campaign:
         if r.process_is_alive(run.get("runner_pid")):
             self.save()
             return True
+        if run.get("stop_kind") == "codex_percentage":
+            self.stop_all("budget_paused", run.get("reason") or "Остановка по остатку лимита Codex.")
+            return False
         rows = q.load_decisions(job / "decisions.jsonl")
         pending_verification = any(row["marker_id"] in allowed and q.verification_status(row) == "pending" for row in rows)
         if entry.get("user_pause_requested"):

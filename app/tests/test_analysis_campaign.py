@@ -20,6 +20,16 @@ def test_portable_package_contains_runner_quota_dependency():
     assert "'AUTOMATIC_ANALYSIS.md'" in manifest
 
 
+def test_campaign_cannot_restart_percentage_stopped_runner(tmp_path, monkeypatch):
+    campaign, job, runs, stops, launches = setup(tmp_path, monkeypatch)
+    runs[job] = {"active": False, "status": "paused", "launch_id": "existing",
+                 "stop_kind": "codex_percentage", "reason": "Остановка при остатке 20%"}
+    assert not campaign.tick()
+    assert campaign.state["status"] == "budget_paused"
+    assert not launches and not stops
+    assert not campaign.tick() and not launches
+
+
 def quota(used=10, secondary=None):
     return {"rateLimitsByLimitId": {"codex": {"primary": {"usedPercent": used}, "secondary": secondary}}}
 

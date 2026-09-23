@@ -32,6 +32,18 @@
       <button id="preview-import" class="warning">Проверить отправку</button>
       <button id="apply-import" class="danger" disabled>Отправить в Svacer</button>
     </section>
+    <section class="panel usage-limit-panel">
+      <label for="usage-limit">Останавливать при остатке Codex ≤</label>
+      <input id="usage-limit" type="number" min="0" max="99" step="1" value="0"> %
+      <button id="save-usage-limit">Сохранить порог</button>
+      <p id="usage-limit-status" aria-live="polite"></p>
+      <p>Например, 20% — остановить анализ при остатке 20% или меньше; 0 — отключено.
+        Проверка перед запуском и каждые 15 секунд, даже при закрытом браузере.
+        Порог сохраняется между запусками; автоматического возобновления нет.
+        Готовые результаты и очередь сохраняются. Если лимит недоступен, анализ останавливается.
+        Учёт может запаздывать, поэтому точный остаток не гарантируется.
+        Более строгая защита автоматической кампании остаётся в силе.</p>
+    </section>
     <section class="workspace">
       <div class="panel marker-panel">
         <div class="filter-row">
