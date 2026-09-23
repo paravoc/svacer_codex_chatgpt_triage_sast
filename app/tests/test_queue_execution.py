@@ -69,6 +69,17 @@ def test_one_marker_object_is_normalized_and_still_checked(tmp_path):
     assert not runner.saved_worker_notes_match(job, ctx)
 
 
+def test_structured_generic_evidence_is_promoted_without_weakening_validation():
+    row = {"marker_id": "m", "verdict": "False Positive", "severity": None, "action": None,
+           "evidence": [{"file_path": "a.c", "line_start": 1, "line_end": 1,
+                         "excerpt": "x", "supports": "fact", "roles": ["source"]}]}
+    normalized = q.normalize_worker_result(row)
+    assert normalized["source_evidence"] == row["evidence"]
+    assert "severity" not in normalized and "action" not in normalized
+    incomplete = q.normalize_worker_result({**row, "evidence": ["a.c:1"]})
+    assert "source_evidence" not in incomplete
+
+
 def test_resume_saved_singleton_note_without_repeating_agent(tmp_path, monkeypatch):
     job = make_job(tmp_path, count=2, budget=1)
     ctx = claim(job, budget=1)
@@ -390,6 +401,41 @@ def test_append_after_failed_manual_run_keeps_existing_reservation(tmp_path, sta
     assert claim(job, workers=2)["batch"]["marker_ids"] == current["batch"]["marker_ids"]
 
 
+@pytest.mark.parametrize("reservation", ["reordered", "outside_prefix", "duplicate"])
+def test_append_to_stopped_queue_checks_membership_not_worker_order(tmp_path, reservation):
+    job = make_job(tmp_path, count=7, workers=3, manual=True)
+    inventory, decisions = job / "markers.inventory.json", job / "decisions.jsonl"
+    selected = ["m00", "m01", "m02", "m03", "m04"]
+    q.enqueue_marker_ids(inventory, decisions, selected)
+    set_pause(job, False)
+    current = claim(job, workers=3)
+    q.atomic_write_json(job / runner.RUN_FILE, {"active": False, "status": "stopped"})
+    status_path = job / "workers.status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert len(status["workers"]) == 3
+    status["workers"].reverse()
+    if reservation == "outside_prefix":
+        status["workers"][0]["marker_ids"] = ["m04"]
+    elif reservation == "duplicate":
+        status["workers"][0]["marker_ids"] = status["workers"][1]["marker_ids"][:]
+    q.atomic_write_json(status_path, status)
+    before = {name: (job / name).read_bytes() for name in (
+        "control.json", "workers.status.json", "decisions.jsonl")}
+    if reservation != "reordered":
+        with pytest.raises(SystemExit, match="Есть незавершённое назначение"):
+            q.enqueue_marker_ids(inventory, decisions, ["m05"])
+        assert all((job / name).read_bytes() == value for name, value in before.items())
+        return
+    result = q.enqueue_marker_ids(inventory, decisions, ["m05"])
+    assert result["queued"] == selected + ["m05"]
+    assert status_path.read_bytes() == before["workers.status.json"]
+    assert decisions.read_bytes() == before["decisions.jsonl"]
+    assert claim(job, workers=3)["paused"]
+    set_pause(job, False)
+    assert set(claim(job, workers=3)["batch"]["marker_ids"]) == set(current["batch"]["marker_ids"])
+    assert q.priority_marker_ids(decisions) == selected + ["m05"]
+
+
 @pytest.mark.parametrize("workers", [1, 2])
 def test_fifteen_manual_draft_retries_finish_fifo_without_unselected_backlog(tmp_path, monkeypatch, workers):
     job = make_job(tmp_path, count=18, workers=workers, manual=True)
@@ -522,6 +568,28 @@ def test_manual_selection_never_fills_from_unselected_backlog(tmp_path):
         runner.finalize_turn(job, ctx)
     assert runner._queue_next(job, tmp_path, {"batch_size": 10, "parallel_workers": 1})["paused"]
     assert sum(row["verdict"] is None for row in q.load_decisions(decisions_path)) == 22
+
+
+def test_stale_completed_priority_is_cleaned_without_recheck_or_failure(tmp_path):
+    job = make_job(tmp_path, count=3, workers=1, manual=True)
+    decisions_path = job / "decisions.jsonl"
+    rows = q.load_decisions(decisions_path)
+    rows[0] = result_for(job, "m00")
+    q.atomic_write_jsonl(decisions_path, rows)
+    q.atomic_write_json(job / "control.json", {
+        "pause_requested": False,
+        "manual_queue_requested": True,
+        "priority_marker_ids": ["m00", "m01"],
+        "recheck_marker_ids": [],
+    })
+
+    context = claim(job)
+
+    assert context["batch"]["marker_ids"] == ["m01"]
+    assert q.load_decisions(decisions_path)[0]["verdict"] == "False Positive"
+    control = json.loads((job / "control.json").read_text(encoding="utf-8"))
+    assert control["priority_marker_ids"] == ["m01"]
+    assert control["recheck_marker_ids"] == []
 
 
 def test_existing_job_without_selection_setting_defaults_to_manual(tmp_path):
@@ -770,6 +838,10 @@ def test_source_request_is_snapshot_bound_and_cannot_loop(tmp_path, monkeypatch)
     assert calls[0]["snapshot_id"] == "exact-snapshot"
     assert (job / ctx["external_sources"][0]["local_path"]).exists()
     q.atomic_write_json(request, payload)
+    assert runner.resolve_source_requests(job, tmp_path, ctx)
+    assert len(calls) == 1  # Reuse the source; never repeat the network request.
+    assert ctx['available_source_requests'][0]['file_path'] == payload[0]['file_path']
+    q.atomic_write_json(request, payload)
     with pytest.raises(runner.IncompleteAnalysisError): runner.resolve_source_requests(job, tmp_path, ctx)
     assert len(calls) == 1
 
@@ -915,7 +987,7 @@ def test_prepare_batch_uses_validated_trace_cache_after_api_failure(tmp_path, mo
     assert json.loads((job / runner.BATCH_CONTEXT_FILE).read_text(encoding="utf-8"))["codex_model"] == "gpt-6-astra"
     assert context["trace_history_unverified"] is True
     assert len(context["trace_files"]) == 1
-    assert "history freshness is not verified" in runner.build_runtime_prompt(job, tmp_path, context)
+    assert "Актуальность истории разметки/комментариев не подтверждена" in runner.build_runtime_prompt(job, tmp_path, context)
 
 
 def test_wontfix_needs_real_defect_and_disposition(tmp_path):
@@ -952,7 +1024,8 @@ def test_policy_v2_rejects_unknown_disguised_as_final_or_missing_policy(tmp_path
     row = result_for(job, "m00", "Won't fix")
     row.update(decision_policy_version=2, component_defect_proven=None,
                product_defect_reachable=False)
-    assert any("verdict contradicts" in error for error in q.validate_worker_result(row, current))
+    assert any("component_defect_proven must be an explicit JSON boolean" in error
+               for error in q.validate_worker_result(row, current))
     row.pop("decision_policy_version")
     assert any("decision_policy_version" in error for error in q.validate_worker_result(row, current))
     row = result_for(job, "m00", "Unclear")
@@ -966,13 +1039,30 @@ def test_policy_v2_rejects_unknown_disguised_as_final_or_missing_policy(tmp_path
 def test_runtime_prompt_separates_component_defect_from_product_reachability(tmp_path):
     job = make_job(tmp_path)
     prompt = runner.build_runtime_prompt(job, tmp_path, claim(job))
-    assert "true / false -> Won't fix" in prompt
-    assert "false / false -> False Positive" in prompt
+    assert "true/false — Won't fix" in prompt
+    assert "false/false — False Positive" in prompt
     assert "decision_policy_version=2" in prompt
-    assert "product path is\n  proven not to reach it" in prompt
+    assert "Отсутствие найденного вызова само по себе не означает false" in prompt
 
 
-def test_model_instructions_are_english_but_require_a_russian_comment(tmp_path):
+def test_runtime_prompt_requires_publication_ready_comments_without_hiding_gaps(tmp_path):
+    job = make_job(tmp_path)
+    prompt = runner.build_runtime_prompt(job, tmp_path, claim(job))
+    assert "проверенный факт, причина статуса и ссылка" in prompt
+    assert "Не добавляй служебные оговорки" in prompt
+    assert "Не скрывай пробелы доказательств" in prompt
+    assert "needs_context, а не подменяй их готовым вердиктом" in prompt
+    assert "обычно 2–4 коротких предложения" in prompt
+    assert "без Markdown-ссылок, обратных кавычек и заголовков" in prompt
+    assert "Пример только стиля, НЕ доказательство" in prompt
+    assert "Не копируй этот вывод" in prompt
+    assert "Пиши короткие ссылки файл:строка" in prompt
+    manual = (Path(__file__).resolve().parents[1] / "CODEX_TASK.md").read_text(encoding="utf-8")
+    assert "no Markdown links, backticks, or headings" in manual
+    assert "Style-only example, NOT evidence" in manual
+
+
+def test_model_instructions_and_progress_are_russian(tmp_path):
     job = make_job(tmp_path)
     context = claim(job)
     prompt = runner.build_runtime_prompt(job, tmp_path, context)
@@ -981,11 +1071,12 @@ def test_model_instructions_are_english_but_require_a_russian_comment(tmp_path):
     )
     manual = (Path(__file__).resolve().parents[1] / "CODEX_TASK.md").read_text(encoding="utf-8")
 
-    assert not any("\u0400" <= char <= "\u04ff" for char in prompt)
-    assert not any("\u0400" <= char <= "\u04ff" for char in verification_prompt)
-    assert not any("\u0400" <= char <= "\u04ff" for char in manual.replace("ГОСТ", ""))
-    assert "translate only the\ncomment field into clear Russian" in prompt
-    assert "Use concise English for verifier fields" in verification_prompt
+    assert any("\u0400" <= char <= "\u04ff" for char in prompt)
+    assert any("\u0400" <= char <= "\u04ff" for char in verification_prompt)
+    assert "Пиши аналитические поля и итоговый comment кратко на русском" in prompt
+    assert "Пиши объяснения и сообщения кратко на русском" in verification_prompt
+    assert "Веди исследование, прогресс" in manual
+    assert "Use concise English" not in prompt
 
 
 @pytest.mark.parametrize("mode", ["good", "missing", "incomplete", "stopped", "confirmed"])

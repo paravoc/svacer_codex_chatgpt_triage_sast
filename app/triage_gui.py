@@ -22,6 +22,8 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable
 
+from comment_format import svacer_comment_text
+
 from desktop_theme import (
     BG, SURFACE, SURFACE_2, TEXT, MUTED, BLUE, GREEN, YELLOW, RED, PURPLE,
     SELECTION, apply_theme, style_window,
@@ -145,9 +147,9 @@ def marker_svacer_url(snapshot_url: str, marker_id: str, file_name: str) -> str:
     return f"{snapshot_url.rstrip('/')}/marker/{encoded}"
 
 
-def latest_codex_activity(job: Path) -> str:
+def latest_codex_activity(job: Path, event_file: str = "codex-events.jsonl") -> str:
     """Return a short, non-sensitive activity label from recent JSONL events."""
-    path = job / "codex-events.jsonl"
+    path = job / event_file
     try:
         lines = path.read_bytes()[-65_536:].decode("utf-8", errors="replace").splitlines()
     except OSError:
@@ -190,9 +192,10 @@ def _short_activity_text(value: Any, limit: int = 500) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def codex_activity_entries(job: Path, limit: int = 30) -> list[str]:
-    """Build a quiet feed containing only user-facing agent messages."""
-    path = job / "codex-events.jsonl"
+def codex_activity_entries(job: Path, limit: int | None = None, *,
+                           event_file: str = "codex-events.jsonl", include_steps: bool = False) -> list[str]:
+    """Agent messages and actual public research; omit routine command chatter."""
+    path = job / event_file
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -212,18 +215,31 @@ def codex_activity_entries(job: Path, limit: int = 30) -> list[str]:
         item = event.get("item")
         if not isinstance(item, dict):
             continue
-        if event_type != "item.completed":
+        if event_type not in {"item.started", "item.completed"}:
             continue
         item_type = str(item.get("type") or "")
-        if item_type == "agent_message":
+        stamp = ""
+        if event.get("timestamp"):
+            try:
+                stamp = datetime.fromisoformat(event["timestamp"]).astimezone().strftime("%H:%M:%S") + " • "
+            except (ValueError, TypeError):
+                pass
+        if item_type == "agent_message" and event_type == "item.completed":
             text = _short_activity_text(item.get("text"))
             if text:
-                entries.append(f"Агент: {text}")
+                entries.append(f"{stamp}Агент: {text}")
+        elif item_type == "web_search" and event_type == "item.completed":
+            text = _short_activity_text(item.get("query"))
+            entries.append(f"{stamp}Публичный веб-поиск" + (f": {text}" if text else ""))
     compact: list[str] = []
     for entry in entries:
         if not compact or compact[-1] != entry:
             compact.append(entry)
-    return compact[-limit:]
+    # ``include_steps`` is retained for compatibility with older callers, but
+    # command start/finish events are intentionally not user-facing messages.
+    if limit is not None and limit > 0:
+        return compact[-limit:]
+    return compact
 
 
 def format_elapsed(seconds: float) -> str:
@@ -275,18 +291,22 @@ def format_run_event_time(run: dict[str, Any], job: Path | None = None) -> str:
 
 def live_run_timing(
     job: Path, run: dict[str, Any], *, now_timestamp: float | None = None,
+    worker: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Describe elapsed and idle time without pretending to know model ETA."""
     if not run.get("active"):
         return "", MUTED
     now_timestamp = time.time() if now_timestamp is None else now_timestamp
     try:
-        started = datetime.fromisoformat(str(run.get("started_at") or "")).timestamp()
+        started = datetime.fromisoformat(str((worker or run).get("started_at") or "")).timestamp()
     except (TypeError, ValueError):
         started = now_timestamp
     try:
-        last_activity = (job / "codex-events.jsonl").stat().st_mtime
-    except OSError:
+        if worker is not None:
+            last_activity = datetime.fromisoformat(str(worker.get("last_event_at") or worker.get("started_at"))).timestamp()
+        else:
+            last_activity = (job / "codex-events.jsonl").stat().st_mtime
+    except (OSError, TypeError, ValueError):
         last_activity = started
     idle_seconds = max(0, now_timestamp - min(last_activity, now_timestamp))
     elapsed = format_elapsed(now_timestamp - min(started, now_timestamp))
@@ -346,7 +366,7 @@ def comment_without_heading(value: Any) -> str:
         lines.pop(0)
     if lines and lines[0].strip().upper() in VERDICT_HEADINGS:
         lines.pop(0)
-    return "\n".join(lines).strip()
+    return svacer_comment_text("\n".join(lines))
 
 
 def list_text(value: Any) -> str:
@@ -416,6 +436,8 @@ def marker_assignments(state: dict[str, Any]) -> dict[str, str]:
     if isinstance(run, dict) and (not run.get("active") or run.get("phase") in {"launching", "repository"}):
         return {}
     result: dict[str, str] = {}
+    runtime = state.get("worker_runtime") or {}
+    live_workers = runtime.get("workers", {})
     for number, worker in (state.get("workers") or {}).items():
         if not isinstance(worker, dict):
             continue
@@ -423,6 +445,15 @@ def marker_assignments(state: dict[str, Any]) -> dict[str, str]:
         current_status = str(worker.get("current_status") or "").casefold()
         saved = {str(value) for value in (worker.get("current_saved_marker_ids") or [])}
         for marker_id in assigned:
+            if runtime:
+                actual = live_workers.get(marker_id, {})
+                if (runtime.get("scheduler") == "continuous" and
+                        actual.get("state") in {"preparing", "starting", "running", "sources", "validating", "verifying"}):
+                    result[marker_id] = f"Агент {number}"
+                    continue
+                if actual.get("state") == "running" and actual.get("pid"):
+                    result[marker_id] = f"Агент {number}"
+                continue
             if marker_id not in saved and current_status in {"", "assigned", "working", "running"}:
                 result[marker_id] = f"Агент {number}"
     for number, verifier in (state.get("verifiers") or {}).items():
@@ -446,6 +477,65 @@ def current_saved_marker_ids(state: dict[str, Any]) -> set[str]:
                 result.update(
                     str(value) for value in (item.get("current_saved_marker_ids") or [])
                 )
+    return result
+
+
+SAVED_RESULT_DETAIL = (
+    "Результат сохранён · завершается запись итогов · "
+    "повторный запуск не требуется"
+)
+
+
+def analysis_configuration_text(job_data: dict[str, Any], state: dict[str, Any]) -> str:
+    """Show configured capacity, not a promise that an empty queue is fully busy."""
+    run = state.get("codex_run") or {}
+    active = bool(run.get("active"))
+    model = (run.get("requested_model") if active and "requested_model" in run
+             else job_data.get("codex_model")) or "по умолчанию Codex"
+    capacity = int((run.get("parallel_workers") if active else None) or job_data.get("parallel_workers") or 1)
+    unit = "агента" if capacity == 1 else "агентов"
+    text = f"Модель: {model} · Параллельно: до {capacity} {unit}"
+    if active:
+        workers = (state.get("worker_runtime") or {}).get("workers") or {}
+        busy = len({row.get("worker") for row in workers.values()
+                    if row.get("state") in {"preparing", "starting", "running", "sources", "validating", "verifying"}})
+        text += f" · занято: {busy}/{capacity}"
+    return text
+
+
+def saved_result_assignments(state: dict[str, Any]) -> dict[str, str]:
+    """Keep completed work visible without counting it as a running process."""
+    run = state.get("codex_run") or {}
+    if not run.get("active") or run.get("phase") in {"launching", "repository"}:
+        return {}
+    runtime = state.get("worker_runtime") or {}
+    current_batch = (state.get("queue") or {}).get("batch")
+    stale_runtime = (
+        runtime.get("launch_id") is not None and runtime.get("launch_id") != run.get("launch_id")
+        or runtime.get("batch") is not None and current_batch is not None
+        and runtime.get("batch") != current_batch
+    )
+    running = marker_assignments(state)
+    result: dict[str, str] = {}
+    for group, label in (("workers", "Агент"), ("verifiers", "Проверяющий")):
+        if group == "workers" and (stale_runtime or run.get("phase") == "verification"):
+            continue
+        for number, worker in (state.get(group) or {}).items():
+            if not isinstance(worker, dict):
+                continue
+            saved = set(map(str, worker.get("current_saved_marker_ids") or []))
+            for marker_id in map(str, worker.get("marker_ids") or []):
+                if marker_id in running:
+                    continue
+                if group == "workers" and runtime:
+                    # A note may already exist during evidence validation. Only
+                    # the terminal worker state confirms that its work finished.
+                    actual = (runtime.get("workers") or {}).get(marker_id, {})
+                    complete = actual.get("state") in {"finished", "applied"}
+                else:
+                    complete = marker_id in saved
+                if complete:
+                    result[marker_id] = f"{label} {number}"
     return result
 
 
@@ -479,7 +569,8 @@ def current_run_queue_ids(
     if not active_run and state.get("one_shot_completed"):
         return []
     active = set(marker_assignments(state))
-    current_saved = current_saved_marker_ids(state)
+    current_saved = (set(saved_result_assignments(state)) if active_run and state.get("worker_runtime")
+                     else current_saved_marker_ids(state))
     priority = [str(value) for value in state.get("priority_marker_ids") or []]
     # Match claim_next_batch: old drafts are not automatically queued, but an
     # explicit user retry must remain visible until it is assigned/completed.
@@ -493,6 +584,33 @@ def current_run_queue_ids(
     return [marker_id for marker_id in priority
             if marker_id not in active and marker_id not in current_saved
             and (marker_id in pending_set or marker_id in recheck_set)]
+
+
+def queued_marker_status(state: dict[str, Any], marker_id: str) -> tuple[str, str]:
+    """A finished worker is not runnable again just because its peers are busy."""
+    worker = ((state.get("worker_runtime") or {}).get("workers") or {}).get(marker_id, {})
+    if (worker.get("state") == "incomplete"
+            or marker_id in set(state.get("deferred_marker_ids") or [])):
+        detail = "Попытка не завершена · автоматически повторно в этом запуске не запускается"
+        if worker.get("error"):
+            detail += " · " + str(worker["error"])
+        else:
+            detail += " · недостающие доказательства указаны в карточке маркера"
+        return "Доисследовать", detail
+    if (state.get("codex_run") or {}).get("active"):
+        if worker.get("state") == "starting" and worker.get("retry_reason"):
+            return "Повтор подключения", str(worker["retry_reason"]) + " · очередь и исходники сохранены"
+        phases = {
+            "starting": ("Запуск", "Запускается отдельный исполнитель"),
+            "sources": ("Исходники", "Исполнитель получает дополнительные исходники · повторного назначения нет"),
+            "validating": ("Проверка", "Проверяются доказательства сохранённого результата"),
+            "finished": ("Результат сохранён", SAVED_RESULT_DETAIL),
+        }
+        if worker.get("state") in phases:
+            return phases[worker["state"]]
+    if marker_id in set(state.get("recheck_marker_ids") or []):
+        return "Перепроверка", "Ожидает запуска перепроверки"
+    return "Ожидает", "Ожидает запуска"
 
 
 def unapplied_draft_results(
@@ -2075,7 +2193,7 @@ class TriageGui:
         self.live_marker_title_var.set(f"{detector} — {short_file(file_name)}:{line}")
         self.live_marker_status_var.set(f"{status}  •  ID {marker_id}")
         self.sync_live_monitor_colors()
-        recent = self.latest_activity_entries[-6:] if marker_id in assignments else []
+        recent = self.latest_activity_entries if marker_id in assignments else []
         fallback = (
             "Откройте карточку: в ней виден сохранённый черновик."
             if marker_id in self.draft_by_id
@@ -3887,6 +4005,7 @@ class TriageGui:
         summary = (
             f"Автоматическая проверка завершена.\n\n"
             f"Маркеров: {preview.get('marker_count')}\n"
+            f"Не включены: {len(preview.get('selection', {}).get('skipped', {}))}\n"
             f"Конфликтов: {preview.get('conflict_count')}"
             f"{conflict_note}\n\n{preview.get('scope', '')}\n\n"
             "Следующий шаг изменит разметку Svacer. Продолжить?"
@@ -3917,13 +4036,13 @@ class TriageGui:
 
     def send_import(self) -> None:
         state = collect_state(self.job)
-        if not state["total"] or state["completed"] != state["total"]:
+        if not state.get("import_ready"):
             self.set_message(
-                f"Отправка недоступна: готово {state['completed']} из {state['total']}. Ничего не отправлено.",
+                state.get("import_error") or "Нет новых готовых решений: остальные уже отправлены или требуют проверки.",
                 error=True,
             )
             return
-        if (self.job / "svacer-import-attempt.json").exists():
+        if state.get("import_blocked"):
             self.set_message("Попытка отправки уже записана; повтор заблокирован.", error=True)
             return
         self.run_background(

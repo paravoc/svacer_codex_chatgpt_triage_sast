@@ -18,6 +18,8 @@ from pathlib import Path
 from uuid import UUID, uuid4, uuid5
 
 import triage_queue as queue
+from comment_format import svacer_comment_text
+from import_selection import BATCHES, blocking_attempt, fingerprint, scope, select_ready
 
 from .client import ConnectorError
 from .service import SvacerService, identifier
@@ -85,12 +87,10 @@ class MarkupImport:
             raise ConnectorError("Нужен существующий каталог задачи в RESULTS.")
         return path
 
-    def inputs(self, job: Path) -> tuple[dict, list[dict], list[dict], dict]:
-        run_file = safe_path(job, "codex-run.json")
-        if run_file.exists() and json.loads(run_file.read_text(encoding="utf-8-sig")).get("active"):
-            raise ConnectorError("Дождитесь остановки анализа перед подготовкой импорта.")
+    def inputs(self, job: Path, marker_ids: list[str] | None = None) -> tuple[dict, list[dict], list[dict], dict, dict]:
         hashes = {name: digest(safe_path(job, name).read_bytes()) for name in
-                  ("job.json", "markers.inventory.json", "decisions.jsonl")}
+                  ("job.json", "markers.inventory.json")}
+        safe_path(job, "decisions.jsonl")
         try:
             config = json.loads((job / "job.json").read_text(encoding="utf-8-sig"))
             inventory = queue.load_inventory(job / "markers.inventory.json")
@@ -103,22 +103,16 @@ class MarkupImport:
             raise ConnectorError("Задача принадлежит другому серверу Svacer.")
         for key in ("project_id", "branch_id", "snapshot_id"):
             config[key] = identifier(config.get(key))
-        original = {m["id"]: m for m in inventory}
+        try:
+            decisions, selection = select_ready(job, config, inventory, decisions, marker_ids)
+        except (ValueError, SystemExit) as exc:
+            raise ConnectorError(str(exc)) from None
         if not decisions:
-            raise ConnectorError("Нет решений для импорта.")
-        for decision in decisions:
-            current = dict(original[decision["marker_id"]])
-            if decision.get("schema_version") is not None:
-                current["schema_version"] = decision["schema_version"]
-            override = decision.get("manual_verdict_override")
-            errors = queue.validate_worker_result(decision, current,
-                allow_manual_verdict_override=isinstance(override, dict)
-                and override.get("verdict") == decision.get("verdict"))
-            if errors:
-                raise ConnectorError("Есть незавершённые или некорректные решения; импорт остановлен.")
-            if decision["verdict"] == "Confirmed" and queue.verification_status(decision) != "verified":
-                raise ConnectorError("Confirmed должен пройти независимую проверку.")
-        return config, inventory, decisions, hashes
+            raise ConnectorError("Нет новых готовых решений: остальные уже отправлены, не завершены или требуют проверки.")
+        # Freeze only the selected decisions. Other workers may finish while the
+        # user reads the preview; their results must not be sent without consent.
+        hashes["selected_decisions"] = digest(canonical(sorted(decisions, key=lambda row: row["marker_id"])))
+        return config, inventory, decisions, hashes, selection
 
     async def export(self, config: dict) -> dict[str, dict]:
         rows = await self.service.api.json_lines("/api/public/markup/export", read_only=True, json={
@@ -140,15 +134,18 @@ class MarkupImport:
             result[invariant] = row
         return result
 
-    async def build(self, job: Path, nonce: str, timestamp: str) -> tuple[dict, bytes]:
-        config, inventory, decisions, hashes = self.inputs(job)
+    async def build(self, job: Path, nonce: str, timestamp: str, *,
+                    marker_ids: list[str] | None = None, selection_info: dict | None = None) -> tuple[dict, bytes]:
+        config, inventory, decisions, hashes, selection = self.inputs(job, marker_ids)
+        if selection_info is not None:
+            selection = selection_info  # informational counts at preview time
         rows, _ = await self.service.marker_rows(config["project_id"], config["branch_id"],
             config["snapshot_id"], advanced_filter=queue.GOST_FILTER)
         remote = {row["id"]: row for row in rows}
         if set(remote) != {m["id"] for m in inventory}:
             raise ConnectorError("Состав ГОСТ-маркеров изменился; обновите инвентарь.")
         for marker in inventory:
-            if any(remote[marker["id"]].get(k) != marker.get(k) for k in ("warnClass", "file", "line")):
+            if any(remote[marker["id"]].get(k) != marker.get(k) for k in ("warnClass", "file", "line", "invariant")):
                 raise ConnectorError("Местоположение маркера изменилось; обновите инвентарь.")
         exported = await self.export(config)
         grouped = {}
@@ -166,8 +163,9 @@ class MarkupImport:
             item = grouped.setdefault(invariant, {"fields": fields, "comments": [], "marker_ids": []})
             if item["fields"] != fields:
                 raise ConnectorError("Одинаковому инварианту назначены разные решения. Импорт запрещён.")
-            if decision["comment"] not in item["comments"]:
-                item["comments"].append(decision["comment"])
+            comment = svacer_comment_text(decision["comment"])
+            if comment not in item["comments"]:
+                item["comments"].append(comment)
             item["marker_ids"].append(decision["marker_id"])
         payload = []
         conflicts = []
@@ -188,11 +186,13 @@ class MarkupImport:
         data = b"".join(canonical(row) + b"\n" for row in payload)
         sha = digest(data)
         phrase = f"IMPORT {job.name} {len(decisions)} {sha[:16]}"
-        preview = {"schema_version": 1, "connector": "triage_connector", "nonce": nonce,
+        preview = {"schema_version": 2, "connector": "triage_connector", "nonce": nonce,
             "created_at": timestamp, "server": self.service.api.url,
             "project_id": config["project_id"], "branch_id": config["branch_id"],
             "snapshot_id": config["snapshot_id"], "marker_count": len(decisions),
             "invariant_count": len(payload), "marker_ids": sorted(d["marker_id"] for d in decisions),
+            "selection": selection, "source_scope": scope(config),
+            "decision_fingerprints": {d["marker_id"]: fingerprint(d) for d in decisions},
             "by_verdict": dict(Counter(d["verdict"] for d in decisions)),
             "payload_sha256": sha, "input_sha256": hashes, "remote_sha256": digest(canonical(prior)),
             "conflicts": conflicts, "conflict_count": len(conflicts), "requires_force": bool(conflicts),
@@ -200,9 +200,20 @@ class MarkupImport:
             "scope": "Разметка Svacer общая для инварианта во всей ветке, включая другие снимки."}
         return preview, data
 
-    def check_no_attempt(self, job: Path) -> None:
-        if safe_path(job, "svacer-import-attempt.json").exists():
-            raise ConnectorError("Попытка импорта уже зарегистрирована. Сначала проверьте её результат в Svacer.")
+    def check_no_attempt(self, job: Path, *, locked: bool = False) -> None:
+        if not locked:
+            safe_path(job, "decisions.jsonl.lock")
+            with queue.decision_lock(job / "decisions.jsonl"):
+                self.check_no_attempt(job, locked=True)
+            return
+        path = safe_path(job, "svacer-import-attempt.json")
+        if path.exists():
+            config = json.loads(safe_path(job, "job.json").read_text(encoding="utf-8-sig"))
+            if blocking_attempt(job, config):
+                raise ConnectorError("Попытка импорта уже зарегистрирована. Сначала проверьте её результат в Svacer.")
+            # Roll forward an already verified batch after a crash. The durable
+            # receipt prevents any resend; its archived attempt remains intact.
+            path.unlink()
 
     async def prepare(self, job_directory: str) -> dict:
         async with self.lock:
@@ -211,9 +222,9 @@ class MarkupImport:
             preview, data = await self.build(job, str(uuid4()), datetime.now(timezone.utc).isoformat())
             safe_path(job, "decisions.jsonl.lock")
             with queue.decision_lock(job / "decisions.jsonl"):
-                if self.inputs(job)[3] != preview["input_sha256"]:
+                if self.inputs(job, preview["marker_ids"])[3] != preview["input_sha256"]:
                     raise ConnectorError("Решения изменились во время подготовки; повторите подготовку.")
-                self.check_no_attempt(job)
+                self.check_no_attempt(job, locked=True)
                 atomic_write(safe_path(job, "svacer-import.jsonl"), data)
                 atomic_write(safe_path(job, "svacer-import-preview.json"), canonical(preview))
             return preview
@@ -225,19 +236,29 @@ class MarkupImport:
             job = self.job_path(job_directory)
             self.check_no_attempt(job)
             stored = json.loads(safe_path(job, "svacer-import-preview.json").read_text(encoding="utf-8"))
-            preview, data = await self.build(job, stored["nonce"], stored["created_at"])
+            if stored.get("schema_version") != 2:
+                raise ConnectorError("Подготовьте отправку заново в текущей версии приложения.")
+            preview, data = await self.build(job, stored["nonce"], stored["created_at"],
+                                             marker_ids=stored["marker_ids"], selection_info=stored["selection"])
             if stored != preview or safe_path(job, "svacer-import.jsonl").read_bytes() != data:
                 raise ConnectorError("Preview, решения или серверная разметка изменились. Подготовьте импорт заново.")
             expected = preview["force_confirmation" if overwrite == "force" else "confirmation"]
             if confirmation != expected or (preview["requires_force"] and overwrite != "force"):
                 raise ConnectorError("Нет точного подтверждения выбранного режима импорта.")
             attempt = {"status": "started", "payload_sha256": preview["payload_sha256"],
-                       "created_at": datetime.now(timezone.utc).isoformat(), "overwrite": overwrite}
+                       "created_at": datetime.now(timezone.utc).isoformat(), "overwrite": overwrite,
+                       "nonce": preview["nonce"], "marker_ids": preview["marker_ids"]}
+            batch = safe_path(job, BATCHES) / str(UUID(preview["nonce"]))
+            safe_path(batch, "receipt.json")
             try:
                 safe_path(job, "decisions.jsonl.lock")
                 with queue.decision_lock(job / "decisions.jsonl"):
-                    if self.inputs(job)[3] != preview["input_sha256"]:
+                    self.check_no_attempt(job, locked=True)
+                    if self.inputs(job, preview["marker_ids"])[3] != preview["input_sha256"]:
                         raise ConnectorError("Решения изменились; импорт остановлен.")
+                    batch.mkdir(parents=True, exist_ok=True)
+                    atomic_write(batch / "preview.json", canonical(preview))
+                    atomic_write(batch / "payload.jsonl", data)
                     with safe_path(job, "svacer-import-attempt.json").open("x", encoding="utf-8") as stream:
                         json.dump(attempt, stream, ensure_ascii=False)
                         stream.flush()
@@ -270,8 +291,21 @@ class MarkupImport:
                 result["message"] = "Ответ или итог импорта не подтверждён. Проверьте журнал Svacer; повторная отправка заблокирована."
             finally:
                 atomic_write(safe_path(job, "svacer-import-result.json"), canonical(result))
-                atomic_write(safe_path(job, "svacer-import-attempt.json"), canonical({
+                final_attempt = {
                     **attempt, "status": result["status"],
                     "finished_at": datetime.now(timezone.utc).isoformat(),
-                    "verification": result["verification"]}))
+                    "verification": result["verification"]}
+                atomic_write(batch / "result.json", canonical(result))
+                atomic_write(batch / "attempt.json", canonical(final_attempt))
+                atomic_write(safe_path(job, "svacer-import-attempt.json"), canonical(final_attempt))
+                if result["verification"]["verified"]:
+                    safe_path(job, "decisions.jsonl.lock")
+                    with queue.decision_lock(job / "decisions.jsonl"):
+                        atomic_write(batch / "receipt.json", canonical({
+                            "schema_version": 1, "verified": True, "nonce": preview["nonce"],
+                            "payload_sha256": preview["payload_sha256"], "scope": preview["source_scope"],
+                            "fingerprints": preview["decision_fingerprints"],
+                            "finished_at": final_attempt["finished_at"],
+                        }))
+                        self.check_no_attempt(job, locked=True)
             return result

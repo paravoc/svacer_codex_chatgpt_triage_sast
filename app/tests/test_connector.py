@@ -212,6 +212,30 @@ def test_prepare_apply_roundtrip_preserves_verdict_and_comment(tmp_path, verdict
     assert fake.sent[0][0]["comments"][0]["text"] == "Guard excludes the invalid state."
 
 
+def test_import_legacy_comment_matches_plain_text_preview_without_editing_evidence(tmp_path):
+    from triage_gui import comment_without_heading
+
+    fake = FakeAPI()
+    job = make_job(tmp_path, fake)
+    rows = q.load_decisions(job / "decisions.jsonl")
+    raw = "Проверка `p != nil` защищает чтение ([main.go:5](/root/.cache/build/main.go:5))."
+    rows[0]["comment"] = raw
+    q.atomic_write_jsonl(job / "decisions.jsonl", rows)
+    before = (job / "decisions.jsonl").read_bytes()
+    imports = MarkupImport(make_service(fake), tmp_path, "fixture-user")
+
+    async def scenario():
+        preview = await imports.prepare(str(job))
+        assert not fake.sent
+        payload = q.load_decisions(job / "svacer-import.jsonl")
+        assert payload[0]["comments"][0]["text"] == comment_without_heading(raw)
+        await imports.apply(str(job), preview["confirmation"])
+
+    run(scenario())
+    assert fake.sent[0][0]["comments"][0]["text"] == "Проверка p != nil защищает чтение (main.go:5)."
+    assert (job / "decisions.jsonl").read_bytes() == before
+
+
 @pytest.mark.parametrize("change", ["phrase", "payload", "decisions", "remote", "last", "scope"])
 def test_apply_rejects_changed_or_unconfirmed_import(tmp_path, change):
     fake = FakeAPI()
@@ -499,13 +523,14 @@ def test_large_list_limits_and_warning_auto_limit():
     run(scenario())
 
 
-def test_live_analysis_prevents_import(tmp_path):
+def test_live_analysis_allows_import_of_saved_validated_results(tmp_path):
     fake = FakeAPI()
     job = make_job(tmp_path, fake)
     q.atomic_write_json(job / "codex-run.json", {"active": True})
-    with pytest.raises(ConnectorError, match="остановки"):
-        run(MarkupImport(make_service(fake), tmp_path, "tester").prepare(str(job)))
-    assert not fake.requests
+    preview = run(MarkupImport(make_service(fake), tmp_path, "tester").prepare(str(job)))
+    assert preview["marker_ids"] == ["m1"]
+    assert not fake.sent
+    assert json.loads((job / "codex-run.json").read_text())["active"]
 
 
 def test_editor_rechecks_attempt_inside_lock(tmp_path, monkeypatch):

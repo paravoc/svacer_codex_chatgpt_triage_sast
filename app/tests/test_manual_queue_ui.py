@@ -14,7 +14,7 @@ import codex_run
 import triage_gui_qt as ui
 import triage_queue as queue
 from triage_dashboard import atomic_json
-from triage_gui import current_run_queue_ids
+from triage_gui import current_run_queue_ids, marker_assignments, saved_result_assignments
 
 
 @pytest.fixture
@@ -63,6 +63,215 @@ def manual_window(tmp_path, monkeypatch):
 
 def table_ids(widget):
     return [widget.item(row, 0).data(ui.Qt.ItemDataRole.UserRole) for row in range(widget.rowCount())]
+
+
+def test_model_and_parallel_capacity_are_visible_next_to_start(manual_window, tmp_path):
+    window, job, run, ids, app = manual_window
+    font = Path("C:/Windows/Fonts/segoeui.ttf")
+    if font.is_file():
+        ui.QFontDatabase.addApplicationFont(str(font))
+    window.setStyleSheet(ui.STYLE)
+    window.resize(1500, 920)
+    window.job_data.update(codex_model="gpt-6-luna", parallel_workers=5)
+    window.state["codex_run"] = {"active": False}
+    window.update_action_states()
+    app.processEvents()
+    text = window.analysis_configuration.text()
+    assert text == "Модель: gpt-6-luna · Параллельно: до 5 агентов"
+    assert window.analysis_configuration.geometry().left() > window.analysis_button.geometry().right()
+    assert window.analysis_configuration.isVisible()
+    assert window.analysis_button.parentWidget().grab().save(str(tmp_path / "analysis-header.png"))
+    window.state.update(codex_run={"active": True, "requested_model": "gpt-6-luna", "parallel_workers": 5},
+                        worker_runtime={"workers": {"m00": {"worker": 1, "state": "running"}}})
+    window.update_action_states()
+    assert "занято: 1/5" in window.analysis_configuration.text()
+
+
+@pytest.mark.parametrize("finished_index", [0, 1])
+def test_saved_parallel_marker_stays_visible_until_batch_finishes(manual_window, finished_index):
+    window, job, run, ids, app = manual_window
+    run.update(active=True, status="running", phase="analysis", launch_id="parallel")
+    atomic_json(job / "codex-run.json", run)
+    atomic_json(job / "control.json", {"priority_marker_ids": ids[:3], "manual_queue_requested": True})
+    atomic_json(job / "workers.status.json", {"state": "assigned", "batch": 1, "workers": [
+        {"worker": i + 1, "status": "assigned", "marker_ids": [mid]} for i, mid in enumerate(ids[:2])]})
+    # Start with two actual processes, then save only one of their results.
+    atomic_json(job / "notes" / "batch-001-worker-1.json", [])
+    runtime = {"launch_id": "parallel", "batch": 1, "workers": {
+        mid: {"worker": i + 1, "state": "running", "pid": 123 + i}
+        for i, mid in enumerate(ids[:2])}}
+    atomic_json(job / "workers-runtime.json", runtime)
+    window.refresh()
+    window.active_table.selectRow(finished_index)
+    finished_id = ids[finished_index]
+    assert window.current_live_id == finished_id
+    before = {name: (job / name).read_bytes() for name in ("control.json", "decisions.jsonl")}
+
+    def finish(index):
+        atomic_json(job / "notes" / f"batch-001-worker-{index + 1}.json", [{
+            "marker_id": ids[index], "verdict": "False Positive", "comment": "Saved proof <safe>"}])
+        runtime["workers"][ids[index]].update(
+            state="finished", pid=None, finished_at="2026-09-23T13:54:13+03:00", duration_seconds=170.9)
+        atomic_json(job / "workers-runtime.json", runtime)
+
+    finish(finished_index)
+    for _ in range(3):
+        window.refresh()
+        app.processEvents()
+        assert table_ids(window.active_table) == ids[:2]
+        assert table_ids(window.queue_table) == ids[2:3]  # saved is NOT runnable again
+        assert "в работе: 1" in window.active_title.text()
+        assert "результат сохранён: 1" in window.active_title.text()
+        assert window.active_table.item(finished_index, 1).text() == "Результат сохранён"
+        assert "повторный запуск не требуется" in window.active_table.item(finished_index, 1).toolTip()
+        assert window.current_live_id == finished_id
+        assert "Результат сохранён" in window.live_meta.text()
+        assert "False Positive" in window.live_meta.text()
+        assert "завершается запись итогов" in window.live_meta.text()
+        assert "Saved proof <safe>" in window.live_text.toPlainText()
+        assert "2 мин 51 с" in window.live_meta.text()
+        assert window.marker_queue_states()[finished_id][0] == "Результат сохранён"
+        assert window.marker_table.item(finished_index, 1).text() == "Результат сохранён"
+        assert not window.remove_queue_button.isEnabled()
+        assert len(marker_assignments(window.state)) == 1  # actual process count remains truthful
+        assert all((job / name).read_bytes() == value for name, value in before.items())
+
+    # Both workers may finish before the parent applies the batch. Neither vanishes.
+    finish(1 - finished_index)
+    window.refresh()
+    assert table_ids(window.active_table) == ids[:2]
+    assert "в работе: 0" in window.active_title.text()
+    assert "результат сохранён: 2" in window.active_title.text()
+    assert table_ids(window.queue_table) == ids[2:3]
+    assert marker_assignments(window.state) == {}
+
+    # Simulate parent finalization; stale runtime must not resurrect completed rows.
+    decisions = [json.loads(line) for line in (job / "decisions.jsonl").read_text().splitlines()]
+    for decision in decisions[:2]:
+        decision.update(verdict="False Positive", comment="Saved proof <safe>")
+    (job / "decisions.jsonl").write_text("".join(json.dumps(row) + "\n" for row in decisions), encoding="utf-8")
+    run.update(active=False, status="completed", phase="completed")
+    window.refresh()
+    assert table_ids(window.active_table) == []
+    assert table_ids(window.queue_table) == ids[2:3]
+    assert saved_result_assignments(window.state) == {}
+    assert all(window.decision_by_id[mid]["verdict"] == "False Positive" for mid in ids[:2])
+
+
+@pytest.mark.parametrize("phase", ["starting", "sources", "validating", "incomplete"])
+def test_saved_note_does_not_hide_worker_before_terminal_state(phase):
+    state = {"codex_run": {"active": True, "phase": "analysis"},
+             "priority_marker_ids": ["m"], "manual_queue_requested": True,
+             "workers": {1: {"marker_ids": ["m"], "current_saved_marker_ids": ["m"]}},
+             "worker_runtime": {"workers": {"m": {"state": phase}}}}
+    assert saved_result_assignments(state) == {}
+    assert current_run_queue_ids([{"marker_id": "m", "verdict": None}], state, {"m"}, ["m"]) == ["m"]
+
+
+def test_saved_assignments_ignore_other_runs_batches_and_unassigned_drafts():
+    state = {"codex_run": {"active": True, "phase": "analysis", "launch_id": "new"},
+             "queue": {"batch": 2},
+             "workers": {1: {"marker_ids": ["m"], "current_saved_marker_ids": ["m", "old"]}},
+             "worker_runtime": {"launch_id": "old", "batch": 2,
+                                "workers": {"m": {"state": "finished"}}}}
+    assert saved_result_assignments(state) == {}
+    state["worker_runtime"].update(launch_id="new", batch=1)
+    assert saved_result_assignments(state) == {}
+    state["worker_runtime"]["batch"] = 2
+    assert saved_result_assignments(state) == {"m": "Агент 1"}
+    for phase in ("launching", "repository", "verification"):
+        state["codex_run"]["phase"] = phase
+        assert saved_result_assignments(state) == {}
+
+
+def test_saved_legacy_and_verifier_assignments_do_not_count_as_running():
+    state = {"codex_run": {"active": True, "phase": "analysis"},
+             "workers": {1: {"marker_ids": ["m", "n"], "current_saved_marker_ids": ["m", "old"]}}}
+    assert saved_result_assignments(state) == {"m": "Агент 1"}
+    assert marker_assignments(state) == {"n": "Агент 1"}
+    state["verifiers"] = {1: {"marker_ids": ["v"], "current_saved_marker_ids": ["v"]}}
+    state["codex_run"]["phase"] = "verification"
+    assert saved_result_assignments(state) == {"v": "Проверяющий 1"}
+
+
+def test_finished_incomplete_workers_are_not_labelled_waiting_for_busy_peer(manual_window):
+    window, job, run, ids, app = manual_window
+    run.update(active=True, status="running", phase="analysis", launch_id="parallel")
+    atomic_json(job / "codex-run.json", run)
+    atomic_json(job / "control.json", {"priority_marker_ids": ids[:3], "manual_queue_requested": True})
+    atomic_json(job / "workers.status.json", {"state": "assigned", "batch": 1, "workers": [
+        {"worker": i + 1, "status": "assigned", "marker_ids": [mid]} for i, mid in enumerate(ids[:3])]})
+    atomic_json(job / "notes" / "batch-001-worker-1.json", [
+        {"marker_id": mid, "analysis_status": "needs_context", "verdict": "Unclear"} for mid in ids[:3]])
+    atomic_json(job / "workers-runtime.json", {"launch_id": "parallel", "batch": 1, "workers": {
+        ids[0]: {"worker": 1, "state": "running", "pid": 123},
+        ids[1]: {"worker": 2, "state": "incomplete", "pid": None, "error": "Repeated source request"},
+        ids[2]: {"worker": 3, "state": "incomplete", "pid": None},
+    }})
+    before = (job / "control.json").read_bytes()
+    window.refresh()
+    app.processEvents()
+    assert table_ids(window.active_table) == ids[:1]
+    assert table_ids(window.queue_table) == ids[1:3]
+    assert [window.queue_table.item(i, 1).text() for i in range(2)] == ["Доисследовать"] * 2
+    assert "Repeated source request" in window.queue_table.item(0, 1).toolTip()
+    assert "доисследовать: 2" in window.queue_title.text()
+    assert window.marker_queue_states()[ids[1]][0] == "Доисследовать"
+    assert (job / "control.json").read_bytes() == before
+
+
+@pytest.mark.parametrize(("phase", "label"), [("starting", "Запуск"), ("sources", "Исходники"), ("validating", "Проверка")])
+def test_worker_source_and_validation_phases_are_not_new_queue_assignments(phase, label):
+    state = {"codex_run": {"active": True}, "worker_runtime": {"workers": {"m": {"state": phase}}}}
+    assert ui.queued_marker_status(state, "m")[0] == label
+
+
+def test_live_panel_has_independent_feed_and_follows_latest_message(manual_window):
+    window, job, run, ids, app = manual_window
+    run.update(active=True, phase="analysis", status="running")
+    paths = []
+    for index, mid in enumerate(ids[:2]):
+        path = f"worker-{index}.jsonl"
+        paths.append(path)
+        (job / path).write_text(json.dumps({"type": "item.completed", "timestamp": "2026-09-22T10:00:00Z",
+                                           "item": {"type": "agent_message", "text": f"UNIQUE-{mid} " + "Evidence. " * 100}}) + "\n")
+    window.state["codex_run"] = run
+    window.state["worker_runtime"] = {"workers": {
+        mid: {"worker": index + 1, "pid": 100 + index, "state": "running", "event_log": paths[index],
+              "started_at": "2026-09-22T10:00:00Z", "last_event_at": "2026-09-22T10:00:00Z"}
+        for index, mid in enumerate(ids[:2])}}
+    for mid in ids[:2]:
+        window.current_live_id = mid
+        window.render_live()
+        app.processEvents()
+        assert f"UNIQUE-{mid}" in window.live_text.toPlainText()
+        assert f"UNIQUE-{ids[1] if mid == ids[0] else ids[0]}" not in window.live_text.toPlainText()
+        assert "Индивидуальный поток" in window.live_text.toPlainText()
+    scrollbar = window.live_text.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum())
+    with (job / paths[1]).open("a") as output:
+        output.write(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "NEWEST-MESSAGE"}}) + "\n")
+    window.render_live()
+    app.processEvents()
+    assert "NEWEST-MESSAGE" in window.live_text.toPlainText()
+    assert scrollbar.value() == scrollbar.maximum()
+
+
+def test_deferred_markers_remain_visible_with_actionable_status(manual_window):
+    window, job, run, ids, app = manual_window
+    atomic_json(job / "control.json", {
+        "priority_marker_ids": ids[7:9], "deferred_marker_ids": ids[7:9],
+        "manual_queue_requested": True, "pause_requested": True,
+    })
+    window.refresh()
+    app.processEvents()
+    assert table_ids(window.queue_table) == ids[7:9]
+    assert [window.queue_table.item(i, 1).text() for i in range(2)] == ["Доисследовать"] * 2
+    assert all(window.marker_queue_states()[mid][0] == "Доисследовать" for mid in ids[7:9])
+    window.current_marker_id = ids[7]
+    window.render_marker()
+    window.update_action_states()
+    assert window.approve_button.isHidden()  # no uncertainty bypass
 
 
 @pytest.mark.parametrize("accepted", [True, False])

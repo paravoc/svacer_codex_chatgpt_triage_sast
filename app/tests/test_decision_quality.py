@@ -40,6 +40,82 @@ def test_proof_matches_source_and_comment(proof):
     assert quality.review_result(*proof) == []
 
 
+def test_plain_comment_keeps_checked_citation_and_does_not_weaken_proof_gate(proof):
+    job, context, row = proof
+    row["comment"] = "Проверка `p == nil` выполняется до чтения поля ([same.go:1](/build/same.go:1))."
+    clean = q.normalize_worker_result(row)
+    assert clean["comment"] == "Проверка p == nil выполняется до чтения поля (same.go:1)."
+    assert quality.review_result(job, context, clean) == []
+    clean["source_evidence"] = [{**ref, "excerpt": "invented source"} for ref in clean["source_evidence"]]
+    assert quality.review_result(job, context, clean)
+
+
+def test_nearby_range_typo_is_repaired_only_by_unique_verbatim_quote(proof):
+    job, context, row = proof
+    row["source_evidence"][0]["line_end"] = 1
+    assert quality.review_result(job, context, row)
+
+    repaired = quality.repair_source_evidence_ranges(job, context, row)
+
+    assert repaired["source_evidence"][0]["line_start"] == 1
+    assert repaired["source_evidence"][0]["line_end"] == 2
+    assert quality.review_result(job, context, repaired) == []
+    assert row["source_evidence"][0]["line_end"] == 1
+
+
+def test_range_repair_never_changes_an_invented_quote(proof):
+    job, context, row = proof
+    row["source_evidence"][0].update(line_end=1, excerpt="invented source")
+    assert quality.repair_source_evidence_ranges(job, context, row) is row
+    assert quality.review_result(job, context, row)
+
+
+def test_source_viewer_line_numbers_are_removed_only_after_exact_source_match(proof):
+    job, context, row = proof
+    original = copy.deepcopy(row)
+    row["source_evidence"][0]["excerpt"] = "1: if p == nil { return }\n2: use(p.value)"
+    assert quality.review_result(job, context, row)
+    repaired = quality.repair_source_evidence_ranges(job, context, row)
+    assert repaired == original
+    assert row["source_evidence"][0]["excerpt"].startswith("1: ")  # caller's raw output kept
+    assert quality.review_result(job, context, repaired) == []
+    assert runner.prune_redundant_invalid_source_evidence(job, context, row) == original
+
+
+def test_viewer_blank_lines_and_real_numeric_source_prefix_are_preserved(proof):
+    job, context, row = proof
+    source = "1: actual source label\n\nreturn value\n"
+    (job / "repository" / "same.go").write_text(source, encoding="utf-8")
+    ref = row["source_evidence"][0]
+    ref.update(line_end=3, excerpt="1: 1: actual source label\n2: \n3: return value")
+    repaired = quality.repair_source_evidence_ranges(job, context, row)
+    assert repaired["source_evidence"][0]["excerpt"] == source.rstrip("\n")
+    assert quality.review_result(job, context, repaired) == []
+    assert quality.repair_source_evidence_ranges(job, context, repaired) is repaired
+
+
+@pytest.mark.parametrize("excerpt", [
+    "2: if p == nil { return }\n3: use(p.value)",  # shifted viewer numbers
+    "1: if p == nil { return }\n3: use(p.value)",  # skipped number
+    "2: if p == nil { return }\n1: use(p.value)",  # reordered
+    "1: if p == nil { return }\nuse(p.value)",     # mixed format
+    "1: if p != nil { return }\n2: use(p.value)",  # changed guard
+    "1: if p == nil { return }\n2: use(other.value)",
+    "1: if p == nil { return }",                    # truncated quote
+])
+def test_numbered_evidence_never_repairs_changed_code_or_wrong_numbering(proof, excerpt):
+    job, context, row = proof
+    row["source_evidence"][0]["excerpt"] = excerpt
+    assert quality.repair_source_evidence_ranges(job, context, row) is row
+    assert quality.review_result(job, context, row)
+
+
+def test_evidence_error_reports_the_reason_not_just_valueerror(proof):
+    job, context, row = proof
+    row["source_evidence"][0]["excerpt"] = "invented source"
+    assert any("excerpt does not match" in error for error in quality.review_result(job, context, row))
+
+
 def test_entrypoint_is_allowed_only_as_an_optional_evidence_role(proof):
     job, context, row = proof
     row["source_evidence"][0]["roles"].append("entrypoint")
@@ -180,6 +256,7 @@ def test_exactly_one_evidence_repair_is_allowed(proof):
     calls = []
     def repair(context):
         assert context["quality_feedback"]
+        assert context["quality_repair_marker_ids"] == ["m00"]
         calls.append(1)
         q.atomic_write_json(path, [row])
     runner.finalize_with_quality_repair(job, job, ctx, repair)

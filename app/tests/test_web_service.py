@@ -85,6 +85,64 @@ def test_unknown_job_id_never_becomes_a_filesystem_path(monkeypatch, tmp_path):
         assert str(tmp_path) not in response.text
 
 
+def test_web_comment_is_plain_text_but_stored_evidence_is_unchanged(monkeypatch, tmp_path):
+    job = make_web_job(tmp_path)
+    rows = queue.load_decisions(job / "decisions.jsonl")
+    rows[0].update(verdict="False Positive",
+                   comment="В `Get()` есть проверка ([main.go:7](/root/build/main.go:7)).",
+                   source_evidence=[{"file_path": "/root/build/main.go", "excerpt": "`literal`"}])
+    queue.atomic_write_jsonl(job / "decisions.jsonl", rows)
+    before = (job / "decisions.jsonl").read_bytes()
+    client, _ = authenticated_client(monkeypatch, tmp_path)
+    with client:
+        job_id = client.get("/api/jobs").json()["jobs"][0]["id"]
+        decision = client.get(f"/api/jobs/{job_id}/markers/marker-1").json()["decision"]
+        assert decision == {**rows[0], "comment": "В Get() есть проверка (main.go:7)."}
+    assert (job / "decisions.jsonl").read_bytes() == before
+
+
+def test_incomplete_selection_stays_in_web_queue_not_active(monkeypatch, tmp_path):
+    job = make_web_job(tmp_path)
+    queue.atomic_write_json(job / "control.json", {
+        "priority_marker_ids": ["marker-1"], "deferred_marker_ids": ["marker-1"],
+        "manual_queue_requested": True,
+    })
+    queue.atomic_write_json(job / "workers.status.json", {
+        "state": "incomplete", "batch": 1,
+        "workers": [{"worker": 1, "status": "incomplete", "marker_ids": ["marker-1"]}],
+    })
+    client, _ = authenticated_client(monkeypatch, tmp_path)
+    with client:
+        job_id = client.get("/api/jobs").json()["jobs"][0]["id"]
+        response = client.get(f"/api/jobs/{job_id}/markers?status=queued")
+        assert response.status_code == 200
+        marker = response.json()["markers"][0]
+        assert marker["status"] == "needs_context"
+        assert marker["queued"] is True and marker["active"] is False
+
+
+def test_web_reports_incomplete_worker_before_batch_deferral(monkeypatch, tmp_path):
+    job = make_web_job(tmp_path)
+    queue.atomic_write_json(job / "control.json", {
+        "priority_marker_ids": ["marker-1"], "manual_queue_requested": True,
+    })
+    queue.atomic_write_json(job / "workers.status.json", {
+        "state": "assigned", "batch": 1,
+        "workers": [{"worker": 1, "status": "assigned", "marker_ids": ["marker-1"]}],
+    })
+    queue.atomic_write_json(job / "codex-run.json", {"launch_id": "live"})
+    queue.atomic_write_json(job / "workers-runtime.json", {
+        "launch_id": "live", "batch": 1,
+        "workers": {"marker-1": {"state": "incomplete", "pid": None}},
+    })
+    monkeypatch.setattr(web, "read_run_record", lambda _: {"active": True, "launch_id": "live"})
+    client, _ = authenticated_client(monkeypatch, tmp_path)
+    with client:
+        job_id = client.get("/api/jobs").json()["jobs"][0]["id"]
+        marker = client.get(f"/api/jobs/{job_id}/markers?status=queued").json()["markers"][0]
+        assert marker["status"] == "needs_context" and not marker["active"]
+
+
 def test_container_uses_locked_dependencies_and_secret_files():
     root = Path(__file__).resolve().parents[2]
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")

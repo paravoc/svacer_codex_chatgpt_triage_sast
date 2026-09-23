@@ -23,7 +23,7 @@ ERROR_STATUSES = frozenset({"failed", "incomplete"})
 DECISION_SNAPSHOT_FIELDS = (
     "verdict", "confidence", "severity", "action", "review_contract_version",
     "source_revision", "decision_policy_version", "component_defect_proven", "product_defect_reachable",
-    "defect_scope", "disposition_reason", "source", "control", "sink", "entrypoint",
+    "defect_scope", "disposition_reason", "disposition_kind", "scope_exclusion", "source", "control", "sink", "entrypoint",
     "build_reachability", "product_reachability", "impact", "reachable_path",
     "evidence", "counterevidence", "proof_gaps", "boundary", "comment", "source_evidence",
 )
@@ -35,6 +35,7 @@ DECISION_FIELD_LABELS = {
     "component_defect_proven": "Дефект компонента доказан",
     "product_defect_reachable": "Достижимость из продукта",
     "defect_scope": "Область дефекта", "disposition_reason": "Основание Won't fix",
+    "disposition_kind": "Тип решения", "scope_exclusion": "Исключение из области разметки",
     "source": "Источник", "control": "Ограничения", "sink": "Опасная операция",
     "entrypoint": "Точка входа", "build_reachability": "Достижимость сборки",
     "product_reachability": "Продуктовый путь", "impact": "Последствие",
@@ -202,6 +203,9 @@ def history_measurements(
         duration_scope = "Общее время партии"
     tokens = source.get("attributed_tokens") if source.get("tokens_exact") else None
     token_scope = "Точный расход одного маркера"
+    if record.get("execution_kind") == "scope_policy":
+        duration_scope = "Локальная проверка области разметки"
+        token_scope = "Без вызова модели: правило области разметки"
     if tokens is None and int(source.get("batch_total_tokens") or 0) > 0:
         tokens = int(source["batch_total_tokens"])
         token_scope = "Общий расход параллельной партии"
@@ -220,10 +224,10 @@ def total_tokens(usage: dict[str, Any]) -> int:
     return int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
 
 
-def read_turn_observability(job: Path, byte_offset: int) -> tuple[dict[str, int], list[str]]:
+def read_turn_observability(job: Path, byte_offset: int, event_file: str = EVENT_FILE) -> tuple[dict[str, int], list[str]]:
     """Read usage and visible agent messages emitted by one Codex turn."""
     try:
-        with (job / EVENT_FILE).open("rb") as stream:
+        with (job / event_file).open("rb") as stream:
             stream.seek(max(0, byte_offset))
             lines = stream.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
@@ -349,6 +353,12 @@ def append_batch_history(
                 "marker_id": marker_id,
             }) or decision
 
+        marker_exit_code = (0 if not context.get("verification_only")
+                            and marker_id in context.get("completed_marker_ids", []) else exit_code)
+        measurement = context.get("worker_measurements", {}).get(marker_id, {})
+        worker_usage, worker_messages = ({}, [])
+        if measurement.get("event_log"):
+            worker_usage, worker_messages = read_turn_observability(job, 0, measurement["event_log"])
         records.append({
             "schema_version": 2,
             "attempt_id": f"{launch_id}:{runner_batch}:{marker_id}",
@@ -371,9 +381,10 @@ def append_batch_history(
             "duration_scope": "single_marker_session" if len(marker_ids) == 1 else "unavailable",
             "batch_duration_seconds": round(elapsed_seconds, 3),
             "worker_elapsed_seconds": round(marker_elapsed, 3),
-            "exit_code": exit_code,
-            "failure_reason": failure_reason if exit_code else "",
-            "status": "completed" if exit_code == 0 else "incomplete" if exit_code == 3 else "failed",
+            "exit_code": marker_exit_code,
+            "failure_reason": (context.get("incomplete_reasons", {}).get(marker_id, failure_reason)
+                               if marker_exit_code == 3 else failure_reason if marker_exit_code else ""),
+            "status": "completed" if marker_exit_code == 0 else "incomplete" if marker_exit_code == 3 else "failed",
             "verdict": decision.get("verdict"),
             "confidence": decision.get("confidence"),
             "decision_snapshot": decision_snapshot(snapshot_source),
@@ -386,8 +397,35 @@ def append_batch_history(
             "agent_messages": list(agent_messages),
             "messages_scope": "marker" if len(marker_ids) == 1 else "batch",
         })
+        if measurement.get("event_log"):
+            records[-1].update(
+                started_at=measurement.get("started_at") or started_at,
+                finished_at=measurement.get("finished_at") or finished_at,
+                duration_seconds=measurement.get("duration_seconds"),
+                duration_scope="independent_marker_session", measurement_version=1,
+                marker_usage=worker_usage,
+                attributed_tokens=total_tokens(worker_usage) if worker_usage else None,
+                tokens_exact=bool(worker_usage) and measurement.get("usage_complete") is True,
+                token_accounting="exact_worker_process" if measurement.get("usage_complete") else "partial_worker_process",
+                agent_messages=worker_messages, messages_scope="marker",
+            )
+        if measurement.get("execution_kind") == "scope_policy":
+            records[-1].update(
+                started_at=measurement.get("started_at") or started_at,
+                finished_at=measurement.get("finished_at") or finished_at,
+                duration_seconds=measurement.get("duration_seconds"),
+                duration_scope="local_scope_policy", measurement_version=1,
+                marker_usage={key: 0 for key in USAGE_KEYS}, attributed_tokens=0,
+                tokens_exact=True, token_accounting="no_model_scope_policy",
+                execution_kind="scope_policy", requested_model=None, agent_messages=[], messages_scope="marker",
+            )
 
     history_path = job / HISTORY_FILE
+    if context.get("continuous"):
+        # The rolling scheduler holds decision_lock. Replaying a durable lease
+        # after a crash must not append a second copy of its saved history.
+        existing = {row.get("attempt_id") for row in _read_jsonl(history_path)}
+        records = [row for row in records if row["attempt_id"] not in existing]
     with history_path.open("a", encoding="utf-8", newline="\n") as stream:
         for record in records:
             stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -514,6 +552,12 @@ def load_marker_history(job: Path) -> list[dict[str, Any]]:
 def normalize_history_measurements(record: dict[str, Any]) -> dict[str, Any]:
     """Do not present batch shares or worker file timestamps as marker measurements."""
     record = dict(record)
+    if (record.get("measurement_version") == 1 and record.get("execution_kind") == "scope_policy"
+            and record.get("duration_scope") == "local_scope_policy"
+            and record.get("token_accounting") == "no_model_scope_policy"):
+        return record  # Zero is measured here: the model was never called.
+    if record.get("measurement_version") == 1 and record.get("duration_scope") == "independent_marker_session":
+        return record
     single = int(record.get("batch_marker_count") or 1) == 1
     if not single:
         if record.get("duration_scope") == "marker_worker":

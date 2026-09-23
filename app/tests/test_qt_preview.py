@@ -21,6 +21,34 @@ import triage_queue as queue  # noqa: E402
 from triage_gui_qt import TriageQtWindow  # noqa: E402
 
 
+def test_send_ready_enabled_for_partial_job_while_other_markers_run(tmp_path, monkeypatch):
+    from test_partial_import import fixture
+    fake, job, _, _ = fixture(tmp_path)
+    app = QApplication.instance() or QApplication([])
+    app_directory = tmp_path / "app"
+    app_directory.mkdir()
+    monkeypatch.setattr(qt_gui, "read_codex_rate_limits", lambda: {})
+    monkeypatch.setattr(qt_gui, "read_codex_models", lambda: [])
+    monkeypatch.setattr(qt_gui, "check_mcp", lambda *_args: "недоступен")
+    window = TriageQtWindow(job, app_directory)
+    try:
+        window.state.update(codex_run={"active": True}, priority_marker_ids=["m2", "m3"])
+        window.update_action_states()
+        assert window.state["completed"] == 1 and window.state["total"] == 4
+        assert window.send_button.isEnabled()
+        assert window.send_button.text() == "Отправить готовые (1)"
+        window.state["import_blocked"] = True
+        window.update_action_states()
+        assert not window.send_button.isEnabled()
+        window.state.update(import_blocked=False, import_ready=0)
+        window.update_action_states()
+        assert not window.send_button.isEnabled()
+        assert not fake.sent
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_ambient_header_animates_without_moving_layout_and_can_be_disabled(monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     parent = QWidget()
@@ -379,10 +407,21 @@ def test_four_tabs_queue_and_card_render_without_side_effects(tmp_path: Path, mo
         window.drain_model_catalog()
         assert window.model_combo.currentData() == "gpt-5.6-sol"
         window.model_combo.setCurrentIndex(window.model_combo.findData("gpt-6-astra"))
+        assert window.analysis_scope_combo.currentData() == "product_and_tooling"
+        window.analysis_scope_combo.setCurrentIndex(window.analysis_scope_combo.findData("shipped_product"))
         window.save_execution_settings()
         assert json.loads((job / "job.json").read_text(encoding="utf-8"))["codex_model"] == "gpt-6-astra"
+        assert json.loads((job / "job.json").read_text(encoding="utf-8"))["analysis_scope"] == "shipped_product"
         window.load_settings_form()
         assert window.model_combo.currentData() == "gpt-6-astra"
+        assert window.analysis_scope_combo.currentData() == "shipped_product"
+        with monkeypatch.context() as running:
+            running.setattr(qt_gui, "read_run_record", lambda _: {"active": True})
+            window.analysis_scope_combo.setCurrentIndex(window.analysis_scope_combo.findData("product_and_tooling"))
+            window.save_execution_settings()
+            assert json.loads((job / "job.json").read_text(encoding="utf-8"))["analysis_scope"] == "shipped_product"
+            assert "завершите текущий анализ" in window.status.text()
+        window.load_settings_form()
         window.refresh()
         assert window.queue_table.rowCount() == 0
         assert window.history_table.rowCount() == 0

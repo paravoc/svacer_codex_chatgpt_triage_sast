@@ -55,12 +55,12 @@ from triage_queue import (
     markers_for_triage, marker_review_status, load_decisions, reset_queue_assignments,
 )
 from triage_gui import (
-    FILTERS, MARKER_INVENTORY_FIELDS, VALID_VERDICTS, active_marker_ids,
+    FILTERS, MARKER_INVENTORY_FIELDS, SAVED_RESULT_DETAIL, VALID_VERDICTS, active_marker_ids,
     codex_activity_entries, comment_without_heading, compact_job_timestamp, create_user_report,
-    current_run_queue_ids, format_count,
+    current_run_queue_ids, format_count, queued_marker_status,
     friendly_run_state, format_run_event_time, job_identity, job_selector_label, latest_codex_activity,
     list_saved_jobs, list_text, live_run_timing, marker_assignments,
-    marker_matches_filter, marker_svacer_url, short_file, unapplied_draft_results,
+    marker_matches_filter, marker_svacer_url, saved_result_assignments, short_file, unapplied_draft_results,
     validate_marker_inventory,
 )
 
@@ -76,8 +76,8 @@ STATUS_TONES = {
     "Confirmed": "red", "False Positive": "green", "Won't fix": "amber",
     "Unclear": "violet", "Черновик": "blue", "В работе": "green",
     "Не завершён": "amber", "Ошибка": "red", "Ожидает": "muted",
-    "Перепроверка": "violet",
-    "В очереди": "blue", "Не в очереди": "muted",
+    "Перепроверка": "violet", "Результат сохранён": "blue",
+    "В очереди": "blue", "Не в очереди": "muted", "Доисследовать": "amber",
 }
 
 
@@ -831,6 +831,10 @@ class TriageQtWindow(QMainWindow):
         self.analysis_button = button("Начать анализ", tone="success")
         self.analysis_button.clicked.connect(self.analysis_action)
         top.addWidget(self.analysis_button)
+        self.analysis_configuration = label("", "muted")
+        self.analysis_configuration.setWordWrap(True)
+        self.analysis_configuration.setAccessibleName("Модель и параллельность анализа")
+        top.addWidget(self.analysis_configuration)
         self.preparation_animation = QLabel()
         self.preparation_animation.setFixedSize(96, 96)
         self.preparation_animation.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -923,8 +927,8 @@ class TriageQtWindow(QMainWindow):
         left_box.addLayout(queue_actions)
         self.active_title = label("В работе — 0", "section")
         right_box.addWidget(self.active_title)
-        self.active_table = table(["Исполнитель / №", "Детектор", "Файл", "Строка"])
-        size_columns(self.active_table, {0: 160, 1: 195, 3: 70}, 2)
+        self.active_table = table(["Исполнитель / №", "Состояние", "Детектор", "Файл", "Строка"])
+        size_columns(self.active_table, {0: 140, 1: 190, 2: 195, 4: 70}, 3)
         self.active_table.setMaximumHeight(240)
         self.active_table.itemSelectionChanged.connect(self.on_active_selected)
         self.active_table.cellClicked.connect(lambda _row, _column: self.on_active_selected())
@@ -1087,6 +1091,20 @@ class TriageQtWindow(QMainWindow):
         )
         box.addWidget(self.model_hint)
         layout.addWidget(model_card)
+        scope_card, box = card()
+        box.addWidget(label("Область разметки этой задачи", "section"))
+        from analysis_scope import SCOPE_LABELS
+        self.analysis_scope_combo = QComboBox()
+        for value, title in SCOPE_LABELS.items():
+            self.analysis_scope_combo.addItem(title, value)
+        box.addWidget(self.analysis_scope_combo)
+        scope_hint = label(
+            "Для поставляемого продукта отдельно подтверждённые build-only инструменты получают "
+            "Won't fix: вне области. Это не означает, что инструмент безопасен. "
+            "Смешанные и неизвестные зависимости проходят обычный анализ.", "muted")
+        scope_hint.setWordWrap(True)
+        box.addWidget(scope_hint)
+        layout.addWidget(scope_card)
         source_card, box = card()
         box.addWidget(label("Исходники проекта", "section"))
         self.source_hint = label("", "muted")
@@ -1474,30 +1492,50 @@ class TriageQtWindow(QMainWindow):
 
     def populate_work_queue(self) -> None:
         assignments = marker_assignments(self.state)
-        active_ids = list(assignments)
+        saved = saved_result_assignments(self.state)
+        displayed = {**assignments, **saved}
+        active_ids = sorted(displayed, key=displayed.__getitem__)
         triage_ids = [str(marker["id"]) for marker in markers_for_triage(list(self.inventory.values()))]
         queued_ids = current_run_queue_ids(self.decisions, self.state, set(self.drafts), triage_ids)
         active_rows = []
         for index, marker_id in enumerate(active_ids, 1):
             marker = self.decision_by_id.get(marker_id) or self.inventory.get(marker_id, {})
-            active_rows.append((assignments[marker_id], marker.get("warnClass") or "—", short_file(marker.get("file")), marker.get("line") or "—"))
+            status = "Результат сохранён" if marker_id in saved else "В работе"
+            active_rows.append((displayed[marker_id], status, marker.get("warnClass") or "—",
+                                short_file(marker.get("file")), marker.get("line") or "—"))
         queue_rows = []
-        rechecks = set(self.state.get("recheck_marker_ids") or [])
+        queue_details = []
         for index, marker_id in enumerate(queued_ids, 1):
             marker = self.decision_by_id.get(marker_id) or self.inventory.get(marker_id, {})
-            queue_rows.append((index, "Перепроверка" if marker_id in rechecks else "Ожидает",
+            status, detail = queued_marker_status(self.state, marker_id)
+            queue_details.append(detail)
+            queue_rows.append((index, status,
                                marker.get("warnClass") or "—", short_file(marker.get("file")), marker.get("line") or "—"))
         for name, widget, rows, ids in (
             ("active", self.active_table, active_rows, active_ids),
             ("queue", self.queue_table, queue_rows, queued_ids),
         ):
             signature = tuple((marker_id, *row) for marker_id, row in zip(ids, rows))
+            if name == "queue":
+                signature = (signature, tuple(queue_details))
             if self._table_signatures.get(name) != signature:
                 set_rows(widget, rows, ids)
                 if name == "queue":
                     color_status_cells(widget, [str(row[1]) for row in rows], column=1)
+                    for row_index, detail in enumerate(queue_details):
+                        widget.item(row_index, 1).setToolTip(detail)
+                else:
+                    color_status_cells(widget, [str(row[1]) for row in rows], column=1)
+                    for row_index, marker_id in enumerate(ids):
+                        widget.item(row_index, 1).setToolTip(
+                            SAVED_RESULT_DETAIL if marker_id in saved else f"В работе · {assignments[marker_id]}"
+                        )
                 self._table_signatures[name] = signature
-        self.active_title.setText(f"В работе — исполнителей: {len(set(assignments.values()))} • назначено маркеров: {len(active_ids)}")
+        self.active_title.setText(
+            f"Текущая партия — в работе: {len(assignments)} • результат сохранён: {len(saved)}"
+            if saved else
+            f"В работе — исполнителей: {len(set(assignments.values()))} • назначено маркеров: {len(assignments)}"
+        )
         run = self.state.get("codex_run") or {}
         if run.get("active"):
             prefix = "В очереди текущего запуска"
@@ -1506,6 +1544,9 @@ class TriageQtWindow(QMainWindow):
         else:
             prefix = "В очереди"
         title = f"{prefix} — {len(queued_ids)}"
+        incomplete_count = sum(row[1] == "Доисследовать" for row in queue_rows)
+        if incomplete_count:
+            title = f"Очередь и доисследование — {len(queued_ids)} · доисследовать: {incomplete_count}"
         if not queued_ids and not active_ids:
             title += " · Выберите маркеры на вкладке «Маркеры»"
         self.queue_title.setText(title)
@@ -1611,7 +1652,35 @@ class TriageQtWindow(QMainWindow):
         marker = self.decision_by_id.get(marker_id) or self.inventory.get(marker_id, {})
         self.live_title.setText(f"{marker.get('warnClass') or 'Маркер'} — {short_file(marker.get('file'))}:{marker.get('line') or '—'}")
         assignments = marker_assignments(self.state)
-        if marker_id in assignments:
+        saved = saved_result_assignments(self.state)
+        runtime_worker = (self.state.get("worker_runtime") or {}).get("workers", {}).get(marker_id)
+        run = self.state.get("codex_run") or {}
+        if runtime_worker and run.get("active") and run.get("phase") != "verification":
+            states = {"preparing": "Подготовка маркера", "starting": "Запуск исполнителя", "running": "В работе",
+                      "sources": "Получение дополнительных исходников", "validating": "Проверка доказательств",
+                      "verifying": "Независимая проверка Confirmed", "applied": "Сохранено в результатах и истории",
+                      "finished": "Результат сохранён; завершается запись итогов",
+                      "incomplete": "Доисследовать — доказательств пока недостаточно"}
+            status = f"{states.get(runtime_worker.get('state'), 'Ожидает')} • Агент {runtime_worker.get('worker')}"
+            event_file = runtime_worker.get("event_log", "codex-events.jsonl")
+            if runtime_worker.get("state") == "running":
+                status += " • " + latest_codex_activity(self.job, event_file)
+            timing, _ = live_run_timing(self.job, run, worker=runtime_worker)
+            if runtime_worker.get("finished_at"):
+                timing = f"Время исследования: {format_history_seconds(runtime_worker.get('duration_seconds'))}"
+            try:
+                stat = (self.job / event_file).stat()
+                signature = (marker_id, stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                signature = (marker_id, None)
+            if signature != self._activity_signature:
+                self._activity_entries = codex_activity_entries(self.job, event_file=event_file, include_steps=True)
+                self._activity_signature = signature
+            shown = self._activity_entries
+            scope = "Индивидуальный поток выбранного маркера. Время обновляется только по событиям его исполнителя."
+            if runtime_worker.get("error"):
+                scope += " " + str(runtime_worker["error"])
+        elif marker_id in assignments:
             run = self.state.get("codex_run") or {}
             agent = assignments[marker_id]
             agent_ids = [key for key, value in assignments.items() if value == agent]
@@ -1632,10 +1701,13 @@ class TriageQtWindow(QMainWindow):
             scope = (
                 "Эта партия содержит один маркер: сообщения ниже относятся к нему."
                 if len(assignments) == 1 else
-                f"Общий поток партии: исполнителей {len(set(assignments.values()))}, "
-                f"маркеров {len(assignments)}. Сообщения не являются комментарием выбранного маркера."
+                f"Общий поток и таймер старого запуска: назначено {len(assignments)} маркеров. "
+                "Число назначений не подтверждает число параллельно работающих процессов."
             )
-            shown = entries[-6:]
+            shown = entries
+        elif marker_id in saved:
+            status = f"Результат сохранён • {saved[marker_id]} • завершается запись итогов"
+            timing, scope, shown = "", SAVED_RESULT_DETAIL, []
         elif marker_id in self.drafts:
             draft = self.drafts[marker_id]
             status = (
@@ -1652,25 +1724,40 @@ class TriageQtWindow(QMainWindow):
             status = (f"В очереди • позиция {queued_ids.index(marker_id) + 1} из {len(queued_ids)}"
                       if marker_id in queued_ids else "Ожидает анализа")
             timing, scope, shown = "", "Маркер ещё не выполняется: индивидуальных сообщений по нему пока нет.", []
+        saved_result = self.drafts.get(marker_id, {}) if marker_id in saved else {}
+        if saved_result.get("verdict") in VALID_VERDICTS:
+            status += f" • {saved_result['verdict']}"
         self.live_meta.setText(f"{status} • ID {marker_id}" + (f"\n{timing}" if timing else ""))
         message = marker.get("msg") or self.inventory.get(marker_id, {}).get("msg") or "Анализ ещё не завершён."
         shown_html = "".join(
             f"<p style='color:{COLORS['violet']}'><b>{index:02d}</b> {escape(entry)}</p>"
-            for index, entry in enumerate(shown, max(1, len(shown) - 5))
+            for index, entry in enumerate(shown, 1)
         )
         html = (
             f"<p style='color:{COLORS['amber']}'>{escape(scope)}</p>"
             + (shown_html or f"<p style='color:{COLORS['muted']}'>Пока нет сообщений агента.</p>")
+            + (f"<h3 style='color:{COLORS['blue']}'>Сохранённый результат</h3>"
+               f"<p>{escape(comment_without_heading(saved_result.get('comment')) or 'Комментарий доступен в карточке маркера.')}</p>"
+               f"<p style='color:{COLORS['muted']}'>{escape(SAVED_RESULT_DETAIL)}</p>"
+               if marker_id in saved else "")
             + f"<h3 style='color:{COLORS['blue']}'>Описание Svacer</h3><p>{escape(str(message))}</p>"
         )
         if self._live_html != html:
+            scroll = self.live_text.verticalScrollBar()
+            old_position = scroll.value()
+            follow = scroll.maximum() - old_position <= 4
             self.live_text.setHtml(html)
+            scroll.setValue(scroll.maximum() if follow else min(old_position, scroll.maximum()))
             self._live_html = html
         if self.live_dialog is not None and self.live_dialog.isVisible():
             self.live_dialog.setWindowTitle(self.live_title.text())
             self.live_dialog_meta.setText(self.live_meta.text())
             if self._live_dialog_html != html:
+                scroll = self.live_dialog_text.verticalScrollBar()
+                old_position = scroll.value()
+                follow = scroll.maximum() - old_position <= 4
                 self.live_dialog_text.setHtml(html)
+                scroll.setValue(scroll.maximum() if follow else min(old_position, scroll.maximum()))
                 self._live_dialog_html = html
 
     def open_live_monitor(self, _item: Any = None) -> None:
@@ -1714,12 +1801,18 @@ class TriageQtWindow(QMainWindow):
         rechecks = set(self.state.get("recheck_marker_ids") or [])
         states = {}
         for index, mid in enumerate(waiting, 1):
+            status, status_detail = queued_marker_status(self.state, mid)
+            if status not in {"Ожидает", "Перепроверка"}:
+                states[mid] = (status, status_detail)
+                continue
             detail = f"В очереди · позиция {index} из {len(waiting)}"
             if mid in rechecks:
                 detail += " · перепроверка"
             states[mid] = ("В очереди", detail)
         for mid, agent in assignments.items():
             states[mid] = ("В работе", f"В работе · {agent}")
+        for mid, agent in saved_result_assignments(self.state).items():
+            states[mid] = ("Результат сохранён", f"{SAVED_RESULT_DETAIL} · {agent}")
         return states
 
     def populate_markers(self) -> None:
@@ -1887,6 +1980,10 @@ class TriageQtWindow(QMainWindow):
         else:
             section("Трасса", "Полная трасса будет загружена перед анализом этого маркера.")
         if (result.get("analysis_status") == "needs_context" or result.get("verdict") == "Unclear") and not decision.get("verdict"):
+            section("Продолжение анализа",
+                    "Проверка остановилась без окончательного вердикта: не хватает доказательств. "
+                    "Исходники и черновик сохранены. Маркер можно оставить в очереди и нажать «Начать анализ» "
+                    "после завершения текущего запуска. Готовые результаты других маркеров сохраняются отдельно.", always=True)
             section("Не завершён — требуется продолжение исследования", list_text(result.get("proof_gaps")), always=True)
         elif result.get("verdict"):
             if draft and not decision.get("verdict"):
@@ -2205,6 +2302,9 @@ class TriageQtWindow(QMainWindow):
     def load_settings_form(self) -> None:
         self.workers.setValue(int(self.job_data.get("parallel_workers") or 1))
         self.populate_model_options(str(self.job_data.get("codex_model") or ""))
+        from analysis_scope import FULL_SCOPE
+        scope_index = self.analysis_scope_combo.findData(self.job_data.get("analysis_scope", FULL_SCOPE))
+        self.analysis_scope_combo.setCurrentIndex(max(0, scope_index))
         self.update_capacity_preview()
         self.source_hint.setText(
             f"{self.job_data.get('repository_url') or 'Репозиторий не задан'}\n"
@@ -2272,6 +2372,13 @@ class TriageQtWindow(QMainWindow):
             return
         try:
             data = read_json(self.job / "job.json")
+            from analysis_scope import FULL_SCOPE, SCOPE_LABELS
+            selected_scope = self.analysis_scope_combo.currentData()
+            if selected_scope not in SCOPE_LABELS:
+                raise ValueError("Выберите область разметки.")
+            if (selected_scope != data.get("analysis_scope", FULL_SCOPE)
+                    and read_run_record(self.job).get("active")):
+                raise ValueError("Перед изменением области разметки завершите текущий анализ.")
             previous_model = normalize_codex_model(data.get("codex_model"))
             selected_model = normalize_codex_model(self.model_combo.currentData())
             if (selected_model != previous_model and selected_model
@@ -2282,6 +2389,7 @@ class TriageQtWindow(QMainWindow):
                 "parallel_workers": workers,
                 "manual_selection_only": True,
                 "codex_model": selected_model or "",
+                "analysis_scope": selected_scope,
             })
             # Leave legacy fields untouched for an already-running coordinator
             # that may still have the previous code loaded in memory.
@@ -2453,13 +2561,13 @@ class TriageQtWindow(QMainWindow):
 
     def send_import(self) -> None:
         state = collect_state(self.job)
-        if not state["total"] or state["completed"] != state["total"]:
+        if not state.get("import_ready"):
             self.set_message(
-                f"Отправка недоступна: готово {state['completed']} из {state['total']}. Ничего не отправлено.",
+                state.get("import_error") or "Нет новых готовых решений: остальные уже отправлены или требуют проверки.",
                 error=True,
             )
             return
-        if (self.job / "svacer-import-attempt.json").exists():
+        if state.get("import_blocked"):
             self.set_message("Попытка отправки уже записана; повтор заблокирован.", error=True)
             return
         self.run_background(
@@ -2481,7 +2589,10 @@ class TriageQtWindow(QMainWindow):
         reply = QMessageBox.question(
             self, "Отправка в Svacer",
             f"Проверка завершена. Маркеров: {preview.get('marker_count')}; "
-            f"конфликтов: {preview.get('conflict_count')}.{conflict}\n\n"
+            f"конфликтов: {preview.get('conflict_count')}.{conflict}\n"
+            f"Не включены в эту отправку: {len(preview.get('selection', {}).get('skipped', {}))}.\n\n"
+            f"Из них требуют проверки: {preview.get('selection', {}).get('needs_attention', 0)}; "
+            f"уже отправлены: {preview.get('selection', {}).get('already_sent', 0)}.\n\n"
             f"{preview.get('scope', '')}\n\n"
             "Следующий шаг изменит разметку Svacer. Продолжить?",
         )
@@ -2613,7 +2724,13 @@ class TriageQtWindow(QMainWindow):
         return Path(identity) if identity else None
 
     def update_action_states(self) -> None:
+        from triage_gui import analysis_configuration_text
         state = self.state
+        configuration_text = analysis_configuration_text(self.job_data, state)
+        self.analysis_configuration.setText(configuration_text)
+        self.analysis_configuration.setMinimumWidth(min(
+            520, self.analysis_configuration.fontMetrics().horizontalAdvance(configuration_text) + 4,
+        ))
         run = state.get("codex_run") or {}
         running = bool(run.get("active"))
         ready = (self.job / "markers.inventory.json").is_file() and (self.job / "decisions.jsonl").is_file()
@@ -2627,7 +2744,6 @@ class TriageQtWindow(QMainWindow):
         self.reset_button.setVisible(ready or running)
         self.reset_button.setEnabled(ready and not running and not self.busy)
         self.analysis_button.setVisible(ready or running)
-        complete = bool(state.get("total") and state.get("completed") == state.get("total"))
         verification_pending = bool(state.get("verification", {}).get("pending"))
         stopping = bool(state.get("paused") or run.get("stop_requested"))
         if running:
@@ -2648,11 +2764,13 @@ class TriageQtWindow(QMainWindow):
             set_button_tone(self.analysis_button, "success")
         self.fetch_button.setEnabled(has_job and not running and not self.busy
                                      and not (self.job / "svacer-import-attempt.json").exists())
-        self.send_button.setEnabled(
-            ready and complete and not running and not self.busy
-            and not state.get("priority_marker_ids")
-            and not (self.job / "svacer-import-attempt.json").exists()
-        )
+        import_ready = int(state.get("import_ready") or 0)
+        self.send_button.setText(f"Отправить готовые ({import_ready})")
+        self.send_button.setToolTip(state.get("import_error") or (
+            "Предыдущая отправка не подтверждена; проверьте её результат." if state.get("import_blocked") else
+            "Отправляются только новые готовые решения. Остальные маркеры и очередь не меняются."
+        ))
+        self.send_button.setEnabled(ready and import_ready > 0 and not self.busy and not state.get("import_blocked"))
         selected_ids = self.selected_marker_ids()
         queue_states = self.marker_queue_states()
         new_ids = [mid for mid in selected_ids if mid not in queue_states]

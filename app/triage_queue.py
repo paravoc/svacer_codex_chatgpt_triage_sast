@@ -19,6 +19,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from comment_format import svacer_comment_text
+
 
 VALID_VERDICTS = {"Confirmed", "False Positive", "Won't fix", "Unclear"}
 GOST_FILTER = 'filter(markers, "ГОСТ 71207-2024" in .checker_labels)'
@@ -89,8 +91,20 @@ def verification_status(decision: dict) -> str:
     return status if status in VALID_VERIFICATION_STATUSES else "pending"
 
 
+def read_state_text(path: Path) -> str:
+    """Read a whole state snapshot, retrying brief Windows replace/AV locks only."""
+    for attempt in range(20):
+        try:
+            return path.read_text(encoding="utf-8-sig")
+        except PermissionError as exc:
+            if (os.name != "nt" and getattr(exc, "winerror", None) not in {5, 32, 33}) or attempt == 19:
+                raise
+            time.sleep(min(.01 * (attempt + 1), .1))
+    raise AssertionError("unreachable")
+
+
 def load_inventory(path: Path) -> list[dict]:
-    value = json.loads(path.read_text(encoding="utf-8-sig"))
+    value = json.loads(read_state_text(path))
     return validate_inventory(value)
 
 
@@ -121,17 +135,16 @@ def validate_inventory(value: object) -> list[dict]:
 
 def load_decisions(path: Path, *, include_reviewed: bool = True) -> list[dict]:
     result = []
-    with path.open("r", encoding="utf-8-sig") as stream:
-        for number, line in enumerate(stream, 1):
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise SystemExit(f"Ошибка JSONL, строка {number}: {exc}") from exc
-            if not isinstance(item, dict):
-                raise SystemExit(f"Строка {number}: ожидался JSON-объект")
-            result.append(item)
+    for number, line in enumerate(read_state_text(path).splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Ошибка JSONL, строка {number}: {exc}") from exc
+        if not isinstance(item, dict):
+            raise SystemExit(f"Строка {number}: ожидался JSON-объект")
+        result.append(item)
     inventory_path = path.parent / "markers.inventory.json"
     if include_reviewed and inventory_path.is_file():
         # Older jobs omitted reviewed markers. Expose blank local work records,
@@ -409,6 +422,22 @@ def next_verification_batch(
     }
 
 
+def replace_state_file(temporary: Path, path: Path) -> None:
+    """Windows readers/AV can briefly deny replace; never truncate the old state.
+
+    A permanent error preserves both the old file and pending temp for recovery.
+    Retries are bounded and apply only to sharing/access-denied errors.
+    """
+    for attempt in range(20):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError as exc:
+            if (os.name != "nt" and getattr(exc, "winerror", None) not in {5, 32, 33}) or attempt == 19:
+                raise
+            time.sleep(min(.01 * (attempt + 1), .1))
+
+
 def atomic_write_jsonl(path: Path, records: list[dict]) -> None:
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="\n") as stream:
@@ -417,7 +446,7 @@ def atomic_write_jsonl(path: Path, records: list[dict]) -> None:
             stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    replace_state_file(temporary, path)
 
 
 def atomic_write_json(path: Path, value: dict) -> None:
@@ -427,7 +456,7 @@ def atomic_write_json(path: Path, value: dict) -> None:
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    replace_state_file(temporary, path)
 
 
 def utc_now() -> str:
@@ -439,7 +468,7 @@ def pause_requested(decisions_path: Path) -> bool:
     if not control_path.exists():
         return False
     try:
-        value = json.loads(control_path.read_text(encoding="utf-8-sig"))
+        value = json.loads(read_state_text(control_path))
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"Некорректный control.json: {exc}") from exc
     if not isinstance(value, dict) or type(value.get("pause_requested", False)) is not bool:
@@ -453,7 +482,7 @@ def priority_marker_ids(decisions_path: Path) -> list[str]:
     if not path.exists():
         return []
     try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        value = json.loads(read_state_text(path))
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"Некорректный control.json: {exc}") from exc
     raw = value.get("priority_marker_ids", []) if isinstance(value, dict) else None
@@ -478,8 +507,29 @@ def clear_priority_request(decisions_path: Path) -> None:
     value.pop("single_marker_requested", None)
     value.pop("manual_queue_requested", None)
     value.pop("recheck_marker_ids", None)
+    value.pop("deferred_marker_ids", None)
     value["updated_at"] = utc_now()
     atomic_write_json(path, value)
+
+
+def runnable_priority_marker_ids(decisions_path: Path) -> list[str]:
+    """Keep unfinished selections visible, but attempt them once per user launch."""
+    selected = priority_marker_ids(decisions_path)
+    path = decisions_path.parent / "control.json"
+    control = json.loads(read_state_text(path)) if path.exists() else {}
+    deferred = set(control.get("deferred_marker_ids") or [])
+    return [mid for mid in selected if mid not in deferred]
+
+
+def defer_incomplete_markers(decisions_path: Path, marker_ids: list[str]) -> None:
+    """Called under decision_lock. Defer, never consume, unfinished manual work."""
+    path = decisions_path.parent / "control.json"
+    control = json.loads(read_state_text(path)) if path.exists() else {}
+    selected = control.get("priority_marker_ids") or []
+    deferred = set(control.get("deferred_marker_ids") or []) | set(marker_ids)
+    control["deferred_marker_ids"] = [mid for mid in selected if mid in deferred]
+    control["updated_at"] = utc_now()
+    atomic_write_json(path, control)
 
 
 def enqueue_marker_ids(inventory_path: Path, decisions_path: Path, ids: list[str]) -> dict:
@@ -524,9 +574,11 @@ def enqueue_marker_ids(inventory_path: Path, decisions_path: Path, ids: list[str
             raise SystemExit("Анализ останавливается. Добавьте маркеры после его остановки")
         existing = priority_marker_ids(decisions_path)
         if (not active and status.get("state") == "assigned" and assigned
-                and existing[:len(assigned)] != assigned):
+                and (len(set(assigned)) != len(assigned)
+                     or set(existing[:len(assigned)]) != set(assigned))):
             raise SystemExit("Есть незавершённое назначение. Сначала завершите или сбросьте прежнюю очередь")
         # A stopped/failed manual launch keeps its reservation at the FIFO head.
+        # Worker grouping may list that same reservation in a different order.
         # Appending after that unchanged prefix is safe and must not require a reset.
         rechecks = control.get("recheck_marker_ids") or []
         if not isinstance(rechecks, list) or any(not isinstance(mid, str) for mid in rechecks):
@@ -638,6 +690,8 @@ def dequeue_marker_ids(decisions_path: Path, ids: list[str]) -> dict:
         if not isinstance(rechecks, list) or any(not isinstance(mid, str) for mid in rechecks):
             raise SystemExit("Некорректный control.json: recheck_marker_ids")
         removed_rechecks = [mid for mid in rechecks if mid in removed]
+        control["deferred_marker_ids"] = [mid for mid in control.get("deferred_marker_ids", [])
+                                           if mid not in removed]
         if remaining:
             control["priority_marker_ids"] = remaining
             control["recheck_marker_ids"] = [mid for mid in rechecks if mid not in removed]
@@ -646,6 +700,7 @@ def dequeue_marker_ids(decisions_path: Path, ids: list[str]) -> dict:
             control.pop("recheck_marker_ids", None)
             control.pop("manual_queue_requested", None)
             control.pop("single_marker_requested", None)
+            control.pop("deferred_marker_ids", None)
             if not active:
                 control["pause_requested"] = True
         control["updated_at"] = utc_now()
@@ -656,6 +711,12 @@ def dequeue_marker_ids(decisions_path: Path, ids: list[str]) -> dict:
             # An old reservation cannot be resumed after its marker was removed.
             stale_worker_status.update(state="superseded", workers=[], updated_at=utc_now())
             atomic_write_json(job / "workers.status.json", stale_worker_status)
+        scheduler_path = job / "scheduler-state.json"
+        if not active and scheduler_path.exists():
+            scheduler = json.loads(scheduler_path.read_text(encoding="utf-8-sig"))
+            scheduler["leases"] = {slot: entry for slot, entry in scheduler.get("leases", {}).items()
+                                   if entry.get("marker_id") not in ids}
+            atomic_write_json(scheduler_path, scheduler)
         return {"removed": ids, "removed_rechecks": removed_rechecks, "queued": remaining}
 
 
@@ -765,8 +826,16 @@ def _reset_queue_assignments_locked(decisions_path: Path) -> dict:
     control.pop("manual_queue_requested", None)
     control.pop("recheck_marker_ids", None)
     control.pop("run_remaining", None)
+    control.pop("deferred_marker_ids", None)
     control.pop("last_completed_batch", None)
+    control.pop("scheduler_completed_attempts", None)
     atomic_write_json(control_path, control)
+
+    scheduler_path = job_directory / "scheduler-state.json"
+    if scheduler_path.exists():
+        scheduler = json.loads(scheduler_path.read_text(encoding="utf-8-sig"))
+        scheduler.update(leases={}, attempted=[])
+        atomic_write_json(scheduler_path, scheduler)
 
     atomic_write_json(job_directory / "workers.status.json", {
         "state": "paused", "updated_at": utc_now(), "batch": None, "workers": [],
@@ -895,15 +964,21 @@ def record_batch_completion(decisions_path: Path) -> bool:
                 control.update(loaded)
         except (OSError, json.JSONDecodeError) as exc:
             raise SystemExit(f"Некорректный control.json: {exc}") from exc
+    completed = {str(row["marker_id"]) for row in load_decisions(decisions_path)
+                 if row.get("verdict") in VALID_VERDICTS}
     consumed = {
         str(marker_id) for worker in status.get("workers", [])
         for marker_id in worker.get("marker_ids", [])
+        if str(marker_id) in completed
     }
     remaining = [mid for mid in control.get("priority_marker_ids", []) if mid not in consumed]
     rechecks = [mid for mid in control.get("recheck_marker_ids", []) if mid not in consumed]
     if remaining:
         control["priority_marker_ids"] = remaining
         control["recheck_marker_ids"] = rechecks
+        control["deferred_marker_ids"] = [mid for mid in control.get("deferred_marker_ids", [])
+                                           if mid in remaining]
+        control["one_shot_completed"] = False
         control["updated_at"] = utc_now()
         atomic_write_json(control_path, control)
         return False
@@ -918,6 +993,7 @@ def record_batch_completion(decisions_path: Path) -> bool:
     control.pop("single_marker_requested", None)
     control.pop("manual_queue_requested", None)
     control.pop("recheck_marker_ids", None)
+    control.pop("deferred_marker_ids", None)
     atomic_write_json(control_path, control)
     return True
 
@@ -1069,6 +1145,8 @@ def normalize_worker_result(row: dict) -> dict:
     The regular evidence and policy validators still run before application.
     """
     result = dict(row)
+    if isinstance(result.get("comment"), str):
+        result["comment"] = svacer_comment_text(result["comment"])
     status = result.get("status")
     if isinstance(status, str) and status in VALID_VERDICTS:
         if not result.get("verdict"):
@@ -1078,6 +1156,21 @@ def normalize_worker_result(row: dict) -> dict:
     if isinstance(result.get("verdict"), str) and result["verdict"] in VALID_VERDICTS:
         for name in ("reachable_path", "counterevidence", "proof_gaps"):
             result.setdefault(name, [])
+        # Some agents follow the generic ``evidence`` field literally and put
+        # the complete review-contract records there. This is an unambiguous
+        # schema alias only when every item already contains all checked fields;
+        # no quote, role, path or conclusion is manufactured here.
+        generic = result.get("evidence")
+        if "source_evidence" not in result and isinstance(generic, list) and generic and all(
+            isinstance(item, dict)
+            and {"file_path", "line_start", "line_end", "excerpt", "supports", "roles"} <= set(item)
+            for item in generic
+        ):
+            result["source_evidence"] = generic
+        if result["verdict"] != "Confirmed":
+            for name in ("severity", "action"):
+                if result.get(name) is None:
+                    result.pop(name, None)
     return result
 
 
@@ -1155,13 +1248,24 @@ def validate_worker_result(
     if not nonempty:
         errors.append(f"{marker_id}: Russian comment must be non-empty")
     policy_version = result.get("decision_policy_version")
-    known_policy = type(policy_version) is int and policy_version in (1, 2)
+    known_policy = type(policy_version) is int and policy_version in (1, 2, 3)
+    scope_exclusion = policy_version == 3 and result.get("disposition_kind") == "scope_exclusion"
+    if policy_version == 3 and not allow_manual_verdict_override:
+        if (not scope_exclusion or verdict != "Won't fix" or result.get("defect_scope") != "out_of_scope"
+                or result.get("component_defect_proven") is not None
+                or result.get("product_defect_reachable") is not None
+                or not isinstance(result.get("scope_exclusion"), dict)
+                or result.get("analysis_status") != "complete"):
+            errors.append(f"{marker_id}: policy 3 is only an explicit scope exclusion, not a defect verdict")
+    elif result.get("disposition_kind") == "scope_exclusion" and not allow_manual_verdict_override:
+        errors.append(f"{marker_id}: scope exclusion requires decision_policy_version=3")
     if strict and not known_policy and not allow_manual_verdict_override:
         errors.append(f"{marker_id}: decision_policy_version=2 is required (1 is accepted for a saved legacy run)")
     if known_policy and not allow_manual_verdict_override:
         expected = {
             "False Positive": {"none"}, "Confirmed": {"product"},
-            "Won't fix": {"component"} if policy_version == 2 else {"component", "product"},
+            "Won't fix": ({"out_of_scope"} if policy_version == 3 else
+                          {"component"} if policy_version == 2 else {"component", "product"}),
             "Unclear": {"unknown"},
         }
         if result.get("defect_scope") not in expected[verdict]:
@@ -1181,13 +1285,20 @@ def validate_worker_result(
                 errors.append(f"{marker_id}: reachability axes must be boolean or null")
             elif component is not None and product is not None:
                 errors.append(f"{marker_id}: Unclear requires at least one unproven axis set to null")
-        elif type(component) is not bool or type(product) is not bool or (component, product) != matrix[verdict]:
+        elif type(component) is not bool or type(product) is not bool:
+            for field in ("component_defect_proven", "product_defect_reachable"):
+                if type(result.get(field)) is not bool:
+                    errors.append(
+                        f"{marker_id}: {field} must be an explicit JSON boolean (true or false); "
+                        "repair the output format using the existing evidence, do not infer it from the verdict"
+                    )
+        elif (component, product) != matrix[verdict]:
             errors.append(f"{marker_id}: verdict contradicts component proof or product reachability")
     if verdict == "Confirmed":
         if result.get("severity") not in VALID_SEVERITIES:
-            errors.append(f"{marker_id}: Confirmed requires severity")
+            errors.append(f"{marker_id}: Confirmed requires severity: Critical | Major | Minor (not confidence low/medium/high)")
         if result.get("action") not in VALID_ACTIONS:
-            errors.append(f"{marker_id}: Confirmed requires action")
+            errors.append(f"{marker_id}: Confirmed requires action: Fix required | Fix submitted | Ignore (not a patch description)")
         if strict and not allow_manual_verdict_override and not result.get("reachable_path"):
             errors.append(f"{marker_id}: Confirmed requires a complete reachable_path")
         if strict and not allow_manual_verdict_override and result.get("proof_gaps"):
@@ -1200,7 +1311,7 @@ def validate_worker_result(
         if result.get("proof_gaps"):
             errors.append(f"{marker_id}: False Positive cannot contain proof_gaps")
     if strict and not allow_manual_verdict_override and verdict == "Won't fix":
-        if not result.get("reachable_path"):
+        if not scope_exclusion and not result.get("reachable_path"):
             errors.append(f"{marker_id}: Won't fix requires a proven reachable_path")
         if result.get("proof_gaps"):
             errors.append(f"{marker_id}: Won't fix cannot contain proof_gaps")
@@ -1289,7 +1400,7 @@ def apply_worker_result_rows(
             lines.pop(0)
         if lines and lines[0].strip().upper() in set(HEADINGS.values()) | {"WON'T FIX"}:
             lines.pop(0)
-        stored["comment"] = "\n".join(lines).strip()
+        stored["comment"] = svacer_comment_text("\n".join(lines))
         # Verification is controlled by the queue, never by the primary analyst.
         stored["verification"] = empty_verification(stored.get("verdict"))
         result_by_id[str(stored["marker_id"])] = stored
@@ -1371,7 +1482,7 @@ def edit_saved_decision(
             "Изменение заблокировано: для этой задачи уже была попытка отправки в Svacer"
         )
 
-    normalized_comment = str(comment or "").strip()
+    normalized_comment = svacer_comment_text(str(comment or ""))
     if not normalized_comment:
         raise SystemExit("Комментарий для Svacer не может быть пустым")
 
@@ -1551,6 +1662,10 @@ def reopen(decisions: list[dict], ids: list[str], path: Path, triage_ids: set[st
         item.pop("decision_policy_version", None)
         item.pop("defect_scope", None)
         item.pop("disposition_reason", None)
+        item.pop("disposition_kind", None)
+        item.pop("scope_exclusion", None)
+        item.pop("component_defect_proven", None)
+        item.pop("product_defect_reachable", None)
         item.pop("review_contract_version", None)
         item.pop("source_revision", None)
         item.pop("source_evidence", None)
@@ -1572,16 +1687,32 @@ def claim_next_batch(inventory_path: Path, decisions_path: Path, limit: int, wor
         drafts = saved_draft_ids(decisions_path.parent, decisions)
         if primary_queue_blocked(decisions_path):
             return {"progress": progress_payload(inventory, decisions), "paused": True, "batch": None}
-        preferred = priority_marker_ids(decisions_path)
+        preferred = runnable_priority_marker_ids(decisions_path)
         control_path = decisions_path.parent / "control.json"
         control = json.loads(control_path.read_text(encoding="utf-8-sig")) if control_path.exists() else {}
         recheck_ids = set(control.get("recheck_marker_ids") or [])
-        selected_priority = preferred[:min(limit, workers)]
         by_id, _ = state(inventory, decisions)
-        unauthorized = [mid for mid in selected_priority if mid in by_id
-                        and by_id[mid].get("verdict") in VALID_VERDICTS and mid not in recheck_ids]
-        if unauthorized:
-            raise SystemExit("Готовое решение не было добавлено на перепроверку: " + ", ".join(unauthorized))
+        # A recovered/applied result may outlive a stale GUI selection. It is
+        # not an implicit recheck: preserve the verdict, remove only that stale
+        # queue entry, and continue with the still-unfinished FIFO entries.
+        stale_completed = [mid for mid in preferred if mid in by_id
+                           and by_id[mid].get("verdict") in VALID_VERDICTS
+                           and mid not in recheck_ids]
+        if stale_completed:
+            stale_set = set(stale_completed)
+            preferred = [mid for mid in preferred if mid not in stale_set]
+            retained = [mid for mid in priority_marker_ids(decisions_path) if mid not in stale_set]
+            if retained:
+                control["priority_marker_ids"] = retained
+            else:
+                control.pop("priority_marker_ids", None)
+                control.pop("manual_queue_requested", None)
+            control["deferred_marker_ids"] = [
+                mid for mid in control.get("deferred_marker_ids", []) if mid in retained
+            ]
+            control["updated_at"] = utc_now()
+            atomic_write_json(control_path, control)
+        selected_priority = preferred[:min(limit, workers)]
         selected_rechecks = [mid for mid in selected_priority if mid in recheck_ids
                              and mid in by_id and by_id[mid].get("verdict") in VALID_VERDICTS]
         if selected_rechecks:
@@ -1594,8 +1725,10 @@ def claim_next_batch(inventory_path: Path, decisions_path: Path, limit: int, wor
                           or control.get("manual_queue_requested") is True else set())
         eligible_priority = [mid for mid in preferred if mid not in drafts or mid in explicit_retry]
         if eligible_priority != preferred:
-            if eligible_priority:
-                control["priority_marker_ids"] = eligible_priority
+            retained = [mid for mid in priority_marker_ids(decisions_path)
+                        if mid not in preferred or mid in eligible_priority]
+            if retained:
+                control["priority_marker_ids"] = retained
             else:
                 control.pop("priority_marker_ids", None)
             atomic_write_json(control_path, control)

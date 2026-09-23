@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from triage_queue import markers_for_triage, marker_review_status, atomic_write_json, decision_lock, job_run_mode
+from triage_queue import markers_for_triage, marker_review_status, atomic_write_json, decision_lock, job_run_mode, read_state_text
 
 
 VALID_VERDICTS = {"Confirmed", "False Positive", "Won't fix", "Unclear"}
@@ -41,12 +41,12 @@ _VT_ENABLED = False
 
 
 def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    return json.loads(read_state_text(path))
 
 
 def read_jsonl(path: Path) -> list[dict]:
     rows: list[dict] = []
-    for line in path.read_text(encoding="utf-8-sig").splitlines():
+    for line in read_state_text(path).splitlines():
         if line.strip():
             value = json.loads(line)
             if isinstance(value, dict):
@@ -123,6 +123,10 @@ def collect_state(job: Path) -> dict:
         "analysis_started": False,
         "import": "not prepared",
         "preview": None,
+        "import_ready": 0,
+        "import_selection": {},
+        "import_blocked": False,
+        "import_error": "",
         "priority_marker_ids": [],
         "recheck_marker_ids": [],
         "manual_queue_requested": False,
@@ -166,6 +170,17 @@ def collect_state(job: Path) -> dict:
                 status = verification.get("status") if isinstance(verification, dict) else "pending"
                 state["verification"][status if status in {"pending", "verified", "challenged"} else "pending"] += 1
         state["pending"] = max(0, state["total"] - state["completed"])
+        if inventory_path.is_file() and decisions_path.is_file() and (job / "job.json").is_file():
+            from import_selection import blocking_attempt, select_ready
+            try:
+                config = read_json(job / "job.json")
+                ready, selection = select_ready(job, config, markers, decisions)
+                state["import_ready"] = len(ready)
+                state["import_selection"] = selection
+                state["import_blocked"] = blocking_attempt(job, config)
+            except (OSError, ValueError, TypeError, KeyError, SystemExit) as exc:
+                state["import_error"] = str(exc)
+                state["import_ready"] = 0
     except (OSError, json.JSONDecodeError, SystemExit) as exc:
         state["errors"].append(f"inventory/decisions: {exc}")
 
@@ -185,7 +200,9 @@ def collect_state(job: Path) -> dict:
                     marker_id = str(row.get("marker_id") or "")
                     if marker_id:
                         worker_saved[worker].add(marker_id)
-                        worker_saved_by_batch[(batch, worker)].add(marker_id)
+                        if (row.get("verdict") in VALID_VERDICTS and row.get("verdict") != "Unclear"
+                                and row.get("analysis_status") != "needs_context"):
+                            worker_saved_by_batch[(batch, worker)].add(marker_id)
                 worker_batches[worker].add(batch)
                 worker_updated[worker] = max(worker_updated[worker], path.stat().st_mtime)
             except (OSError, json.JSONDecodeError) as exc:
@@ -208,9 +225,10 @@ def collect_state(job: Path) -> dict:
     current_batch = state["queue"].get("batch") if isinstance(state.get("queue"), dict) else None
     for worker in sorted(set(worker_saved) | set(current_by_worker)):
         current = current_by_worker.get(worker, {})
+        assigned_batch = current.get("batch", current_batch)
         current_saved = (
-            worker_saved_by_batch[(current_batch, worker)]
-            if type(current_batch) is int else set()
+            worker_saved_by_batch[(assigned_batch, worker)]
+            if type(assigned_batch) is int else set()
         )
         state["workers"][worker] = {
             "saved": len(worker_saved[worker]),
@@ -315,6 +333,7 @@ def collect_state(job: Path) -> dict:
                     str(item) for item in (control.get("recheck_marker_ids") or [])
                     if isinstance(item, str) and item
                 ]
+                state["deferred_marker_ids"] = list(control.get("deferred_marker_ids") or [])
                 if control.get("run_remaining") is not None:
                     state["run_remaining"] = max(0, int(control["run_remaining"]))
         except (OSError, json.JSONDecodeError, SystemExit, TypeError, ValueError) as exc:
@@ -341,6 +360,10 @@ def collect_state(job: Path) -> dict:
             state["import"] = "prepared; waiting for confirmation"
         except (OSError, json.JSONDecodeError):
             state["import"] = "preview is invalid"
+    from parallel_analysis import read_worker_runtime
+    runtime = read_worker_runtime(job)
+    if runtime.get("batch") == current_batch:
+        state["worker_runtime"] = runtime
     return state
 
 
@@ -521,6 +544,7 @@ def _set_pause_locked(job: Path, paused: bool) -> None:
     if not paused:
         control["analysis_started"] = True
         control["one_shot_completed"] = False
+        control.pop("deferred_marker_ids", None)
         # A failed/incomplete batch has a reserved remainder. Keep it when
         # resuming after a transient Svacer/model failure; otherwise starting
         # again would silently turn 4 remaining markers into a fresh batch of 10.
@@ -814,8 +838,8 @@ def main() -> int:
                     message = "Импорт не запускался: сначала нажмите M, войдите в Svacer, затем нажмите R."
                     continue
                 if key == "i":
-                    if state["total"] == 0 or state["completed"] != state["total"]:
-                        message = "Импорт можно готовить только после заполнения всех решений."
+                    if not state.get("import_ready"):
+                        message = "Нет новых готовых решений для отправки. Остальные уже отправлены или требуют проверки."
                         continue
                     try:
                         message = "Проверяю фильтр, маркеры и текущую разметку Svacer. Подождите..."

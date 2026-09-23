@@ -48,7 +48,9 @@ def test_codex_execution_isolated_from_user_config_and_secret_environment(tmp_pa
     assert "--ignore-user-config" in command
     assert "--ignore-rules" in command
     assert "--approve-for-me" in command
+    assert "--ephemeral" not in command
     assert "--sandbox" not in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert "project_doc_max_bytes=0" in command
     assert 'shell_environment_policy.inherit="core"' in command
     assert "shell_environment_policy.ignore_default_excludes=false" in command

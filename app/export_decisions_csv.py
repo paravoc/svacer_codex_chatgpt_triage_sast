@@ -9,6 +9,8 @@ import json
 import sys
 from pathlib import Path
 
+from comment_format import svacer_comment_text
+
 
 def read_jsonl(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8-sig") as stream:
@@ -40,6 +42,8 @@ def main() -> int:
         writer.writeheader()
         for item in decisions:
             row = dict(item)
+            if isinstance(row.get("comment"), str):
+                row["comment"] = svacer_comment_text(row["comment"])
             for name in ("reachable_path", "evidence", "counterevidence", "proof_gaps"):
                 row[name] = "\n".join(str(value) for value in item.get(name, []))
             verification = item.get("verification") if isinstance(item.get("verification"), dict) else {}

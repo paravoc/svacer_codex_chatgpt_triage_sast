@@ -23,6 +23,7 @@ from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
 from codex_run import launch_runner, read_run_record, stop_run
+from comment_format import svacer_comment_text
 from local_jobs import require_idle, update_marker_inventory
 from project_setup import create_project, list_remote_refs
 from triage_dashboard import call_mcp_tool, collect_state, read_json, read_jsonl, set_pause
@@ -332,11 +333,20 @@ async def api_markers(request: Request) -> Response:
         by_id = {str(row.get("marker_id") or ""): row for row in decisions}
         state = collect_state(job)
         queued = set(state.get("priority_marker_ids") or [])
+        deferred = set(state.get("deferred_marker_ids") or [])
+        running = bool(read_run_record(job).get("active"))
         active = {
             str(marker_id) for worker in (state.get("workers") or {}).values()
             for marker_id in (worker.get("marker_ids") or [])
-            if marker_id not in set(worker.get("current_saved_marker_ids") or [])
+            if running and worker.get("current_status") in {"assigned", "working", "running"}
+            and marker_id not in set(worker.get("current_saved_marker_ids") or [])
         }
+        runtime = state.get("worker_runtime") or {}
+        if runtime:
+            active = {mid for mid, worker in runtime.get("workers", {}).items()
+                      if running and worker.get("state") == "running" and worker.get("pid")}
+            deferred.update(mid for mid, worker in runtime.get("workers", {}).items()
+                            if worker.get("state") == "incomplete")
         query = request.query_params.get("q", "").strip().casefold()
         status_filter = request.query_params.get("status", "all")
         rows = []
@@ -347,11 +357,12 @@ async def api_markers(request: Request) -> Response:
             decision = by_id.get(marker_id, {})
             review = marker_review_status(marker)
             verdict = str(decision.get("verdict") or "")
-            status = "active" if marker_id in active else "queued" if marker_id in queued else verdict or review
+            status = ("active" if marker_id in active else "needs_context" if marker_id in deferred
+                      and marker_id in queued else "queued" if marker_id in queued else verdict or review)
             haystack = " ".join(str(marker.get(key) or "") for key in ("id", "warnClass", "file", "line", "msg")).casefold()
             if query and query not in haystack:
                 continue
-            if status_filter != "all" and status_filter != status:
+            if status_filter != "all" and status_filter != status and not (status_filter == "queued" and marker_id in queued):
                 continue
             rows.append({
                 "id": marker_id, "status": status, "queued": marker_id in queued,
@@ -381,6 +392,8 @@ async def api_marker(request: Request) -> Response:
             raise LookupError("Маркер не найден.")
         decision = next((row for row in load_decisions(job / "decisions.jsonl")
                          if str(row.get("marker_id") or "") == marker_id), {})
+        if isinstance(decision.get("comment"), str):
+            decision = {**decision, "comment": svacer_comment_text(decision["comment"])}
         return JSONResponse({"ok": True, "marker": marker, "decision": decision})
     return await guarded(request, action)
 
@@ -474,8 +487,8 @@ async def api_import_preview(request: Request) -> Response:
     async def action() -> Response:
         job = selected_job(request.path_params["job_id"])
         state = collect_state(job)
-        if not state.get("total") or state.get("completed") != state.get("total"):
-            raise ValueError(f"Готово {state.get('completed', 0)} из {state.get('total', 0)}; отправка заблокирована.")
+        if not state.get("import_ready") or state.get("import_blocked"):
+            raise ValueError(state.get("import_error") or "Нет новых готовых решений либо предыдущая отправка не подтверждена.")
         mcp_url, token = mcp_connection()
         reply = await call_mcp_tool(mcp_url, token, "prepare_markup_import", {"job_directory": str(job)})
         return JSONResponse({"ok": True, "preview": json.loads(reply)})
