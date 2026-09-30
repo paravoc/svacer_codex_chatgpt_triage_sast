@@ -1717,31 +1717,38 @@ class TriageQtWindow(QMainWindow):
         saved = saved_result_assignments(self.state)
         runtime_worker = (self.state.get("worker_runtime") or {}).get("workers", {}).get(marker_id)
         run = self.state.get("codex_run") or {}
-        if runtime_worker and run.get("active") and run.get("phase") != "verification":
+        if runtime_worker and run.get("active"):
             states = {"preparing": "Подготовка маркера", "starting": "Запуск исполнителя", "running": "В работе",
                       "sources": "Получение дополнительных исходников", "validating": "Проверка доказательств",
                       "verifying": "Независимая проверка Confirmed", "applied": "Сохранено в результатах и истории",
                       "finished": "Результат сохранён; завершается запись итогов",
                       "incomplete": "Доисследовать — доказательств пока недостаточно"}
             status = f"{states.get(runtime_worker.get('state'), 'Ожидает')} • Агент {runtime_worker.get('worker')}"
-            event_file = runtime_worker.get("event_log", "codex-events.jsonl")
-            if runtime_worker.get("state") == "running":
+            event_file = runtime_worker.get("event_log")
+            if runtime_worker.get("state") == "running" and event_file:
                 status += " • " + latest_codex_activity(self.job, event_file)
             timing, _ = live_run_timing(self.job, run, worker=runtime_worker)
             if runtime_worker.get("finished_at"):
                 timing = f"Время исследования: {format_history_seconds(runtime_worker.get('duration_seconds'))}"
             try:
-                stat = (self.job / event_file).stat()
-                signature = (marker_id, stat.st_mtime_ns, stat.st_size)
+                stat = (self.job / event_file).stat() if event_file else None
+                if stat is None:
+                    raise FileNotFoundError
+                signature = (marker_id, run.get("launch_id"), event_file, stat.st_mtime_ns, stat.st_size)
             except OSError:
                 signature = (marker_id, None)
             if signature != self._activity_signature:
-                self._activity_entries = codex_activity_entries(self.job, event_file=event_file, include_steps=True)
+                self._activity_entries = codex_activity_entries(self.job, event_file=event_file, include_steps=True) if event_file else []
                 self._activity_signature = signature
             shown = self._activity_entries
             scope = "Индивидуальный поток выбранного маркера. Время обновляется только по событиям его исполнителя."
             if runtime_worker.get("error"):
                 scope += " " + str(runtime_worker["error"])
+        elif marker_id in assignments and run.get("execution_mode") == "independent_workers":
+            status = f"В работе • {assignments[marker_id]} • ожидаются данные исполнителя"
+            timing = ""
+            scope = "Индивидуальный журнал маркера ещё недоступен. Ожидается обновление его исполнителя."
+            shown = []
         elif marker_id in assignments:
             run = self.state.get("codex_run") or {}
             agent = assignments[marker_id]

@@ -47,8 +47,9 @@ def execute(job, initial):
     return run_continuous(r, job, job.parent, job.parent, "exact-revision", "test", r.now_iso(), initial)
 
 
-def test_fast_slot_saves_history_and_starts_next_before_slow_peer_finishes(tmp_path, monkeypatch):
-    job, initial, _ = setup(tmp_path, monkeypatch)
+@pytest.mark.parametrize("workers", [3, 4])
+def test_fast_slot_saves_history_and_starts_next_before_slow_peer_finishes(tmp_path, monkeypatch, workers):
+    job, initial, _ = setup(tmp_path, monkeypatch, workers=workers)
     outcome = []
     task = threading.Thread(target=lambda: outcome.append(execute(job, initial)))
     task.start()
@@ -58,9 +59,12 @@ def test_fast_slot_saves_history_and_starts_next_before_slow_peer_finishes(tmp_p
         decisions = q.load_decisions(job / "decisions.jsonl")
         if not decisions[0].get("verdict") and sum(bool(row.get("verdict")) for row in decisions) >= 4:
             history = (job / "marker-history.jsonl").read_text(encoding="utf-8")
-            assert "m03" in history or "m04" in history
-            observed = True
-            break
+            # Result and history are separate atomic files. Observe both
+            # publications before the slow peer exits, rather than asserting
+            # that an unlocked reader cannot land between the two writes.
+            if "m03" in history or "m04" in history:
+                observed = True
+                break
         time.sleep(.03)
     task.join(timeout=20)
     assert not task.is_alive() and outcome == [(0, "", 0)]
@@ -76,7 +80,7 @@ def test_fast_slot_saves_history_and_starts_next_before_slow_peer_finishes(tmp_p
     for _, change in sorted(intervals):
         live += change
         peak = max(peak, live)
-    assert peak == 3
+    assert peak == workers
     history = [json.loads(line) for line in (job / "marker-history.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len(history) == 7 and all(row["tokens_exact"] for row in history)
     assert all(row["duration_seconds"] > 0 for row in history)

@@ -362,7 +362,9 @@ def collect_state(job: Path) -> dict:
             state["import"] = "preview is invalid"
     from parallel_analysis import read_worker_runtime
     runtime = read_worker_runtime(job)
-    if runtime.get("batch") == current_batch:
+    # Rolling slots own independent batches. The launch is already checked by
+    # read_worker_runtime; comparing one global batch drops every rolling feed.
+    if runtime and (runtime.get("scheduler") == "continuous" or runtime.get("batch") == current_batch):
         state["worker_runtime"] = runtime
     from usage_guard import SETTING, snapshot, validate_threshold
     state["usage_guard"] = snapshot(job)

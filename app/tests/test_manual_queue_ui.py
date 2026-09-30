@@ -46,6 +46,7 @@ def manual_window(tmp_path, monkeypatch):
     monkeypatch.setattr(codex_run, "read_run_record", lambda _job: dict(run))
     monkeypatch.setattr(ui, "read_codex_rate_limits", lambda: {})
     monkeypatch.setattr(ui, "read_codex_models", lambda: [])
+    monkeypatch.setattr(ui, "read_local_mcp_token", lambda: "")
     monkeypatch.setattr(ui.TriageQtWindow, "check_connection", lambda _self: None)
     monkeypatch.setattr(ui, "launch_runner", lambda *_args: pytest.fail("No live analysis"))
     window = ui.TriageQtWindow(job, app_dir)
@@ -271,6 +272,51 @@ def test_live_panel_has_independent_feed_and_follows_latest_message(manual_windo
     app.processEvents()
     assert "NEWEST-MESSAGE" in window.live_text.toPlainText()
     assert scrollbar.value() == scrollbar.maximum()
+
+
+@pytest.mark.parametrize("phase", ["analysis", "verification"])
+def test_refresh_loads_rolling_streams_without_global_batch_and_never_mixes_logs(manual_window, monkeypatch, phase):
+    window, job, run, ids, app = manual_window
+    run.update(active=True, phase=phase, status="running", launch_id="rolling-test", execution_mode="independent_workers")
+    atomic_json(job / "codex-run.json", run)
+    atomic_json(job / "workers.status.json", {
+        "batch": 9, "scheduler": "continuous", "workers": [
+            {"worker": i + 1, "marker_ids": [mid], "status": "working", "assigned": 1}
+            for i, mid in enumerate(ids[:2])],
+    })
+    workers = {}
+    for i, mid in enumerate(ids[:2]):
+        path = f"rolling-{i}.jsonl"
+        (job / path).write_text(json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": f"ONLY-{mid}"}}) + "\n")
+        workers[mid] = {"worker": i + 1, "state": "running", "pid": 100 + i, "event_log": path}
+    atomic_json(job / "workers-runtime.json", {"launch_id": "rolling-test", "scheduler": "continuous", "workers": workers})
+    (job / "codex-events.jsonl").write_text(json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message", "text": "SHARED-STREAM-WITH-OTHER-MARKERS"}}) + "\n")
+    window.refresh()
+    assert window.state["worker_runtime"]["scheduler"] == "continuous"
+    for mid in ids[:2]:
+        window.current_live_id = mid
+        window.render_live()
+        text = window.live_text.toPlainText()
+        assert f"ONLY-{mid}" in text
+        assert f"ONLY-{ids[1] if mid == ids[0] else ids[0]}" not in text
+        assert "SHARED-STREAM" not in text
+    # Even a metadata gap must never fall back to the combined batch journal.
+    window.state.pop("worker_runtime")
+    window.current_live_id = ids[0]
+    window.render_live()
+    assert "SHARED-STREAM" not in window.live_text.toPlainText()
+    assert "ожидаются данные исполнителя" in window.live_meta.text()
+    # A new reservation exists before its per-marker log file is assigned.
+    window.state["worker_runtime"] = {"workers": {ids[0]: {"worker": 1, "state": "preparing"}}}
+    window.render_live()
+    assert "SHARED-STREAM" not in window.live_text.toPlainText()
+    # An earlier launch's rolling metadata is not admitted by the collector.
+    atomic_json(job / "workers-runtime.json", {"launch_id": "older-launch", "scheduler": "continuous", "workers": workers})
+    window.refresh()
+    assert not window.state.get("worker_runtime")
+    assert "SHARED-STREAM" not in window.live_text.toPlainText()
 
 
 def test_deferred_markers_remain_visible_with_actionable_status(manual_window):
