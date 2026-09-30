@@ -39,7 +39,7 @@ def repository_source(repository: Path, file_path: str) -> Path | None:
         return None
     normalized = file_path.replace("\\", "/")
     candidates = [Path(file_path), repository / normalized.lstrip("/")]
-    for prefix in ("/src/src/", "/execroot/envoy/", "/envoy/"):
+    for prefix in ("/src/src/", "/execroot/envoy/", "/envoy/", "/app/"):
         if prefix in normalized:
             candidates.append(repository / normalized.split(prefix, 1)[1])
     root = repository.resolve()

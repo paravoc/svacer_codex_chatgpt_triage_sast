@@ -268,7 +268,7 @@ def test_notification_from_another_job_opens_its_marker(tmp_path: Path, monkeypa
         window.close()
 
 
-def test_four_tabs_queue_and_card_render_without_side_effects(tmp_path: Path, monkeypatch) -> None:
+def test_five_tabs_queue_and_card_render_without_side_effects(tmp_path: Path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     root = tmp_path
     app_directory = root / "app"
@@ -298,6 +298,8 @@ def test_four_tabs_queue_and_card_render_without_side_effects(tmp_path: Path, mo
     monkeypatch.setattr(qt_gui, "read_codex_rate_limits", lambda: {
         "rateLimits": {"primary": {"usedPercent": 51, "windowDurationMins": 10080}},
     })
+    monkeypatch.setattr(qt_gui, "read_local_mcp_token", lambda: "")
+    monkeypatch.setattr(qt_gui, "check_mcp", lambda *_args: "недоступен")
     monkeypatch.setattr(qt_gui, "read_codex_models", lambda: [
         {"model": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol"},
         {"model": "gpt-6-astra", "display_name": "GPT-6-Astra"},
@@ -313,8 +315,8 @@ def test_four_tabs_queue_and_card_render_without_side_effects(tmp_path: Path, mo
         window._jobs_future.result(timeout=3)
         window.drain_jobs()
         assert window.jobs_table.rowCount() == 1
-        assert [window.tabs.tabText(index).split()[0] for index in range(4)] == [
-            "Обзор", "Маркеры", "История", "Настройки",
+        assert [window.tabs.tabText(index).split()[0] for index in range(5)] == [
+            "Обзор", "Маркеры", "История", "Настройки", "Issue",
         ]
         assert "История" not in [widget.text() for widget in window.markers_tab.findChildren(QPushButton)]
         assert window.open_svacer_button.property("tone") == "primary"
@@ -399,7 +401,7 @@ def test_four_tabs_queue_and_card_render_without_side_effects(tmp_path: Path, mo
         window.refresh()
         assert window.analysis_button.property("tone") == "neutral"
 
-        for index in range(4):
+        for index in range(5):
             window.tabs.setCurrentIndex(index)
             app.processEvents()
         assert window._model_future is not None

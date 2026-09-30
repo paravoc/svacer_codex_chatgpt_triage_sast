@@ -44,6 +44,8 @@ from project_setup_qt import ProjectSetupDialog
 from svacer_login_qt import SvacerLoginDialog
 from svacer_connection import local_port, read_local_mcp_token
 from marker_notifications import dismiss_notification, dismiss_notifications, sync_notifications
+from poc_generation import existing_generations, generate_for_marker
+from artifact_tasks import ArtifactTasks
 from triage_dashboard import (
     atomic_json, call_mcp_tool, check_mcp, collect_state, friendly_mcp_error,
     read_json, read_jsonl, resolve_job, set_pause,
@@ -522,6 +524,8 @@ class TriageQtWindow(QMainWindow):
         self.mcp_url = str(self.settings.get("mcp_url") or "http://127.0.0.1:8002/mcp")
         self.token = read_local_mcp_token()
         self.busy = False
+        self._closed = False
+        self.artifact_tasks = ArtifactTasks(self)
         self.import_applying = False
         self.connected = False
         self.connection_retries = 0
@@ -571,6 +575,7 @@ class TriageQtWindow(QMainWindow):
         self.setMinimumSize(1060, 720)
         self.resize(1280, 840)
         self.build_ui()
+        self.artifact_tasks.changed.connect(self.update_artifact_ui)
         self.timer = QTimer(self)
         self.timer.setInterval(2000)
         self.timer.timeout.connect(self.refresh)
@@ -633,6 +638,10 @@ class TriageQtWindow(QMainWindow):
         self.delete_job_button.clicked.connect(self.delete_current_job)
         projects.addWidget(self.delete_job_button)
         outer.addLayout(projects)
+        self.artifact_status = label("", "muted")
+        self.artifact_status.setWordWrap(True)
+        self.artifact_status.hide()
+        outer.addWidget(self.artifact_status)
 
         self.tabs = QTabWidget()
         self.overview_tab = QWidget()
@@ -650,6 +659,9 @@ class TriageQtWindow(QMainWindow):
         self.build_markers()
         self.build_history()
         self.build_settings()
+        from developer_issues_qt import DeveloperIssuesTab
+        self.issues_tab = DeveloperIssuesTab(self)
+        self.tabs.addTab(self.issues_tab, "Issue разработчику")
 
         footer = QHBoxLayout()
         self.fetch_button = button("Получить маркеры", tone="primary")
@@ -1006,6 +1018,7 @@ class TriageQtWindow(QMainWindow):
         decision_head = QHBoxLayout()
         decision_head.addStretch(1)
         for title, key, callback, tone in (
+            ("Сгенерировать PoC", "poc_button", self.generate_or_open_poc, "violet"),
             ("Подтвердить черновик", "approve_button", self.approve_current_draft, "success"),
             ("Разметить только этот", "triage_one_button", self.queue_selected_marker, "primary"),
         ):
@@ -1243,6 +1256,8 @@ class TriageQtWindow(QMainWindow):
                         break
 
     def on_tab_changed(self, index: int) -> None:
+        if hasattr(self, "issues_tab") and self.tabs.widget(index) is self.issues_tab:
+            self.issues_tab.refresh(force=True)
         if index == 2:
             self.populate_history()
         elif index == 3 and not self._model_catalog_loaded and self._model_future is None:
@@ -1389,6 +1404,7 @@ class TriageQtWindow(QMainWindow):
             )
             self.populate_jobs()
             self.populate_work_queue()
+            self.issues_tab.refresh()
             if self.tabs.currentIndex() == 2:
                 self.populate_history()
             self.update_action_states()
@@ -1501,11 +1517,25 @@ class TriageQtWindow(QMainWindow):
             self._table_signatures["jobs"] = signature
 
     def closeEvent(self, event: Any) -> None:
+        if self.issues_tab.running:
+            self.issues_tab.stop_queue()
+            event.ignore()
+            self.set_message("Очередь issue остановится после текущего элемента. Затем можно закрыть окно.")
+            return
+        if self.artifact_tasks.active:
+            event.ignore()
+            self.set_message("Фоновые материалы ещё готовятся. Окно можно закрыть после сохранения текущих результатов.")
+            return
+        if not self.issues_tab.save_editor():
+            event.ignore()
+            return
         if self.import_applying and self._task_future is not None and not self._task_future.done():
             event.ignore()
             self.set_message("Дождитесь завершения отправки и обратной проверки Svacer.", error=True)
             return
         self.timer.stop()
+        self._closed = True
+        self.artifact_tasks.shutdown()
         self.jobs_poll_timer.stop()
         self.task_poll_timer.stop()
         self.connection_timer.stop()
@@ -2271,6 +2301,80 @@ class TriageQtWindow(QMainWindow):
         if self.current_marker_id:
             self.open_svacer_url(self.current_marker_id)
 
+    def generate_or_open_poc(self) -> None:
+        marker_id = self.current_marker_id
+        if not marker_id:
+            self.set_message("Сначала выберите маркер.", error=True)
+            return
+        try:
+            generations = existing_generations(
+                self.job, marker_id, decision=self.decision_by_id.get(marker_id),
+                source_revision=str(self.job_data.get("git_commit") or ""),
+            )
+        except (OSError, ValueError) as exc:
+            self.set_message(f"Не удалось проверить файлы PoC: {exc}", error=True)
+            return
+        if generations:
+            try:
+                os.startfile(str(generations[-1]))
+                self.set_message(f"Открыта локальная папка PoC: {generations[-1]}")
+            except OSError as exc:
+                self.set_message(f"Не удалось открыть папку PoC: {exc}", error=True)
+            return
+
+        decision = self.decision_by_id.get(marker_id, {})
+        if decision.get("verdict") != "Confirmed":
+            self.set_message("Генерация PoC доступна только для Confirmed.", error=True)
+            return
+        if (decision.get("verification") or {}).get("status") != "verified":
+            self.set_message("Сначала завершите независимую проверку Confirmed.", error=True)
+            return
+        if self.artifact_tasks.is_active(self.job, marker_id):
+            self.set_message("Материалы этого маркера уже готовятся. Другие маркеры доступны.")
+            return
+        answer = QMessageBox.question(
+            self, "Сгенерировать PoC",
+            "В Codex будут переданы карточка выбранного Confirmed и только привязанные к нему "
+            "фрагменты исходного кода для генерации PoC. Codex работает с учётной записью, "
+            "настроенной на этом компьютере. Файлы сохранятся локально; программа их не запустит. "
+            "Продолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        job_dir = self.job
+        selected_model = str(self.job_data.get("codex_model") or "") or None
+        self.run_artifact(
+            job_dir, marker_id,
+            lambda: generate_for_marker(job_dir, marker_id, model=selected_model),
+            lambda result: self.on_poc_generated(result, job_dir),
+            "Codex готовит PoC по подтверждённому маркеру…",
+            kind="PoC",
+            failed=lambda exc: self.set_message(f"Не удалось сгенерировать PoC: {exc}", error=True),
+        )
+
+    def on_poc_generated(self, result: dict[str, Any], job: Path | None = None) -> None:
+        if job is None or job == self.job:
+            self.marker_signature = None
+            self._table_signatures.pop("markers", None)
+            self.refresh()
+        self.issues_tab.refresh(force=True)
+        directory = str(result.get("directory") or "")
+        if result.get("status") == "generated_unverified":
+            self.set_message(
+                f"PoC-файлы созданы в {directory}. Они не запускались; проверьте README и выполните "
+                "план проверки в изолированной среде."
+            )
+        else:
+            summary = str(result.get("summary") or "")
+            gaps = result.get("missing_evidence") or []
+            gap_text = "; ".join(str(item) for item in gaps[:4])
+            self.set_message(
+                f"Codex запросил дополнительные доказательства. Список сохранён в {directory}: "
+                f"{gap_text or summary[:260]}"
+            )
+
     def open_live_in_svacer(self) -> None:
         if self.current_live_id:
             self.open_svacer_url(self.current_live_id)
@@ -2283,13 +2387,34 @@ class TriageQtWindow(QMainWindow):
         self.busy = value
         for widget in (
             self.fetch_button, self.connection_button, self.send_button,
-            self.triage_one_button, self.approve_button, self.edit_button,
+            self.triage_one_button, self.approve_button, self.edit_button, self.poc_button,
             self.new_job_button, self.refresh_jobs_button, self.settings_apply_button,
             self.delete_job_button,
         ):
             widget.setEnabled(not value)
         self.job_combo.setEnabled(not value)
+        self.issues_tab.update_actions()
         self.update_action_states()
+
+    def run_artifact(self, job: Path, marker_id: str, work: Callable[[], Any],
+                     done: Callable[[Any], None], message: str, *, kind: str,
+                     failed: Callable[[Exception], None] | None = None) -> bool:
+        started = self.artifact_tasks.start(
+            job, marker_id, work, done,
+            failed or (lambda exc: self.set_message(str(exc), error=True)),
+            kind=kind, label=f"{kind}: {job.name} · {marker_id[:12]}",
+        )
+        if started:
+            self.set_message(message)
+        return started
+
+    def update_artifact_ui(self) -> None:
+        tasks = list(self.artifact_tasks.active.values())
+        self.artifact_status.setText("Материалы в фоне: " + " · ".join(task.label for task in tasks[:4])
+                                     + (f" · ещё {len(tasks) - 4}" if len(tasks) > 4 else ""))
+        self.artifact_status.setVisible(bool(tasks))
+        self.update_action_states()
+        self.issues_tab.refresh(force=True)
 
     def run_background(
         self, work: Callable[[], Any], done: Callable[[Any], None], message: str,
@@ -2478,6 +2603,9 @@ class TriageQtWindow(QMainWindow):
 
     def edit_project_source(self) -> None:
         if self.busy:
+            return
+        if self.artifact_tasks.for_job(self.job):
+            self.set_message("Дождитесь сохранения материалов этой задачи перед сменой исходников.", error=True)
             return
         try:
             require_idle(self.job)
@@ -2779,9 +2907,10 @@ class TriageQtWindow(QMainWindow):
         has_job = (self.job / "job.json").is_file()
         self.fetch_button.setVisible(has_job)
         self.fetch_button.setText("Обновить маркеры" if ready else "Получить маркеры")
-        self.delete_job_button.setEnabled(has_job and not running and not self.busy)
+        artifacts_active = self.artifact_tasks.for_job(self.job)
+        self.delete_job_button.setEnabled(has_job and not running and not self.busy and not artifacts_active)
         self.settings_apply_button.setEnabled(has_job and not self.busy)
-        self.source_button.setEnabled(has_job and not running and not self.busy)
+        self.source_button.setEnabled(has_job and not running and not self.busy and not artifacts_active)
         self.report_button.setEnabled(has_job and ready and not self.busy)
         self.reset_button.setVisible(ready or running)
         self.reset_button.setEnabled(ready and not running and not self.busy)
@@ -2831,6 +2960,36 @@ class TriageQtWindow(QMainWindow):
         marker_id = self.current_marker_id
         decision = self.decision_by_id.get(marker_id or "", {})
         draft = self.drafts.get(marker_id or "", {})
+        is_confirmed = decision.get("verdict") == "Confirmed"
+        verified_confirmed = is_confirmed and (decision.get("verification") or {}).get("status") == "verified"
+        try:
+            generations = existing_generations(
+                self.job, marker_id, decision=decision,
+                source_revision=str(self.job_data.get("git_commit") or ""),
+            ) if marker_id else []
+        except (OSError, ValueError):
+            generations = []
+        generation_status = ""
+        if generations:
+            try:
+                generation_status = str(read_json(generations[-1] / "generation.json").get("status") or "")
+            except (OSError, ValueError, json.JSONDecodeError):
+                generations = []
+        self.poc_button.setVisible(is_confirmed)
+        artifact_active = bool(marker_id and self.artifact_tasks.is_active(self.job, marker_id))
+        self.poc_button.setText(
+            "Материалы готовятся…" if artifact_active else
+            "Открыть PoC" if generation_status == "generated_unverified" else
+            "Открыть требования к PoC" if generation_status == "needs_evidence" else
+            "Сгенерировать PoC"
+        )
+        self.poc_button.setToolTip(
+            "Открыть ранее созданные файлы PoC" if generations else
+            "Для генерации требуется независимая проверка Confirmed" if not verified_confirmed else
+            "Сгенерировать локальные файлы PoC для выбранного Confirmed"
+        )
+        self.poc_button.setEnabled(bool(is_confirmed and (generations or verified_confirmed)
+                                        and not artifact_active and not self.busy))
         self.edit_button.setEnabled(not self.busy and decision.get("verdict") in VALID_VERDICTS)
         can_approve = bool(draft and draft.get("analysis_status") != "needs_context"
                            and draft.get("verdict") in VALID_VERDICTS and not running and not self.busy)
@@ -2942,6 +3101,8 @@ class TriageQtWindow(QMainWindow):
         )
 
     def check_connection(self) -> None:
+        if self._closed:
+            return
         if self._connection_future is not None or self.login_dialog is not None:
             return
         self.connection.setText("Svacer: проверка…")
@@ -3092,6 +3253,9 @@ class TriageQtWindow(QMainWindow):
             self.run_background(work, done, "Получаю маркеры из Svacer и готовлю локальную очередь…")
 
     def delete_current_job(self) -> None:
+        if self.artifact_tasks.for_job(self.job):
+            self.set_message("Дождитесь сохранения материалов этой задачи перед её удалением.", error=True)
+            return
         if self.busy or not (self.job / "job.json").is_file():
             return
         job = self.job
@@ -3129,6 +3293,7 @@ class TriageQtWindow(QMainWindow):
                             "Перемещаю локальную задачу в корзину…")
 
     def show_empty_workspace(self) -> None:
+        self.issues_tab.refresh(force=True)
         self.state = {}
         self.job_data = {}
         self.inventory, self.decision_by_id, self.drafts, self.traces = {}, {}, {}, {}

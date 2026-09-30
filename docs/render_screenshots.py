@@ -7,6 +7,7 @@ Requires the locked Poetry desktop dependency group.
 from __future__ import annotations
 
 import json
+import argparse
 import os
 from pathlib import Path
 import sys
@@ -37,6 +38,7 @@ def demo_job(root: Path) -> Path:
     write_json(job / "job.json", {
         "repository_url": "https://example.invalid/demo-gateway.git",
         "git_ref": "demo-v1", "parallel_workers": 1,
+        "git_commit": "12345678" + "0" * 32,
         "advanced_filter": GOST_FILTER,
     })
     examples = [
@@ -64,14 +66,14 @@ def demo_job(root: Path) -> Path:
         if verdict:
             row.update({
                 "entrypoint": "Демонстрационный вход: example()",
-                "source": "Тестовое значение в учебном примере.",
+                "source": "A missing entry returns NULL in this fictional example.",
                 "control": "Показан разбор проверки перед операцией.",
                 "sink": f"{file}:{line}",
                 "build_reachability": "Учебная конфигурация.",
-                "product_reachability": "Показана оценка достижимости для демонстрации.",
-                "impact": "Учебный пример — не оценка реального продукта.",
+                "product_reachability": "The demo handler processes a missing entry.",
+                "impact": "The fictional process can stop; this is not a real product assessment.",
                 "evidence": ["Пример записи доказательства с указанием файла и строки."],
-                "comment": "Демонстрационный комментарий. Не отправлять в Svacer.",
+                "comment": "The fictional handler dereferences a missing entry without a NULL check.",
             })
             if verdict == "Confirmed":
                 row.update(severity="Major", action="Fix Required")
@@ -99,6 +101,10 @@ def demo_job(root: Path) -> Path:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Скриншоты на вымышленных данных")
+    parser.add_argument("--issues-only", action="store_true")
+    args = parser.parse_args()
+    gui.read_local_mcp_token = lambda: ""
     gui.read_codex_rate_limits = lambda: {
         "rateLimits": {"primary": {"usedPercent": 28, "windowDurationMins": 10080}}
     }
@@ -138,6 +144,19 @@ def main() -> None:
                 window._jobs_future.result(timeout=5)
                 window.drain_jobs()
             window.connection.setText("Svacer: демонстрационный режим")
+            if args.issues_only:
+                tab = window.issues_tab
+                tab.refresh(force=True)
+                tab.enqueue(True)
+                for item in tab.store.load_queue():
+                    tab.store.update(item["id"], **tab.store.prepare(item))
+                tab.render_queue()
+                tab.queue_table.selectRow(0)
+                window.tabs.setCurrentWidget(tab)
+                capture(window, "developer-issues")
+                window.resize(1060, 720)
+                capture(window, "developer-issues-compact")
+                return
             for name, tab in (
                 ("overview", window.overview_tab),
                 ("markers", window.markers_tab),

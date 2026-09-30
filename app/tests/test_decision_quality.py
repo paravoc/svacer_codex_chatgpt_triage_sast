@@ -40,6 +40,17 @@ def test_proof_matches_source_and_comment(proof):
     assert quality.review_result(*proof) == []
 
 
+def test_container_app_prefix_maps_product_and_vendor_to_checkout(tmp_path):
+    repo = tmp_path / "repository"
+    for relative in ("pkg/logql/evaluator.go", "vendor/github.com/twmb/franz-go/pkg/kadm/metadata.go"):
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("package sample\n", encoding="utf-8")
+        assert quality.repository_source(repo, "/app/" + relative) == path.resolve()
+    assert quality.repository_source(repo, "/app/../outside.go") is None
+    assert quality.repository_source(repo, "/application/pkg/logql/evaluator.go") is None
+
+
 def test_plain_comment_keeps_checked_citation_and_does_not_weaken_proof_gate(proof):
     job, context, row = proof
     row["comment"] = "Проверка `p == nil` выполняется до чтения поля ([same.go:1](/build/same.go:1))."

@@ -8,7 +8,8 @@ $docsFiles = @(
     'screenshots/overview.png', 'screenshots/markers.png',
     'screenshots/in-progress.png', 'screenshots/notifications.png',
     'screenshots/history.png', 'screenshots/settings.png',
-    'screenshots/multi-select.png', 'CONNECTOR.md', 'PROMPTING.md', 'AUTOMATIC_ANALYSIS.md'
+    'screenshots/multi-select.png', 'screenshots/developer-issues.png',
+    'CONNECTOR.md', 'PROMPTING.md', 'AUTOMATIC_ANALYSIS.md', 'DEVELOPER_ISSUES.md'
 )
 $appFiles = @(
     'START.ps1', 'bootstrap.ps1', 'startup_splash.ps1', 'CODEX_TASK.md',
@@ -30,6 +31,7 @@ $appFiles = @(
     'dependency_sources.py', 'investigation.py', 'result_transport.py', 'source_inspect.py', 'web_research.py',
     'make_portable_package.ps1', 'make_portable_package.cmd',
     'triage_queue.py', 'local_jobs.py', 'project_setup.py', 'project_setup_qt.py',
+    'developer_issues.py', 'poc_generation.py', 'issue_workspace.py', 'issue_brief.py', 'developer_issues_qt.py', 'artifact_tasks.py',
     'create_shortcut.ps1', 'make_windows_icon.py',
     'make_mcp_decisions_template.py', 'validate_mcp_decisions.py',
     'export_decisions_csv.py', 'extract_gost_markers.py', 'run_extractor.cmd',
